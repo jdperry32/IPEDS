@@ -1,0 +1,1920 @@
+create or replace PACKAGE BODY                            ETL_IPEDS_WINTER_COLLECTION AS
+/******************************************************************************
+   NAME:       IPEDS_WINTER_COLLECTION 
+   PURPOSE:    Create IPEDS Winter Collection file.
+   
+
+   REVISIONS:
+   Ver        Date        Author           Description
+   ---------  ----------  ---------------  ------------------------------------
+   1.0        02/07/2022  rbarrin3         1. Created package
+                                                       
+******************************************************************************/
+
+    PROCEDURE PZ_WINTER_GRADUATION_RATES (p_term IN varchar2) IS
+    /*=============================================================================
+            AUTHOR: Bob Barringer
+
+       DESCRIPTION: Creates the detail records for the Winter Collection 100% & 150% graduation rates.
+                    Previous submissions can be found by looking at the reporting_term.
+    ==============================================================================*/  
+     
+        v_spriden_pidm                spriden.spriden_pidm%TYPE; 
+        v_spriden_id                  spriden.spriden_id%TYPE;
+        v_shrdgmr_grst_code           shrdgmr.shrdgmr_grst_code%TYPE;
+        v_shrdgmr_term_code_grad      shrdgmr.shrdgmr_term_code_grad%TYPE;
+        v_ipeds_sex                   spbpers.spbpers_sex%TYPE;   
+        v_spbpers_ssn                 spbpers.spbpers_ssn%TYPE;  
+        v_race_code                   varchar2(1);
+        v_spbpers_dead_ind            spbpers.spbpers_dead_ind%TYPE;   
+        v_sgbstdn_styp_code           sgbstdn.sgbstdn_styp_code%TYPE;  
+        v_shrdgmr_degc_code           shrdgmr.shrdgmr_degc_code%TYPE;  
+        v_initial_text                varchar2(20);
+        v_revised_text                varchar2(20);
+        v_rate                        varchar2(10);
+        v_awlevel                     number;
+        v_degree_rk                   number;
+        v_pell_ind                    varchar2(10);
+        v_dsub_ind                    varchar2(10);  
+        v_dunsub_ind                  varchar2(10);
+        v_cohort_term                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 9);
+        v_spring_1                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 1);
+        v_summer_1                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 2);
+        v_fall_1                      varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 3);
+        v_spring_2                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 4);
+        v_summer_2                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 5);
+        v_fall_2                      varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 6);
+        v_spring_3                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 7);
+        v_summer_3                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 8);
+        -- **** 200% add ***
+        v_fall_4                      varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 9);
+        v_spring_4                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 10);
+        v_summer_4                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 11);
+       
+
+        CURSOR cur_grad_100_150 IS 
+            WITH main_query AS (  -- Export the results of this query to the All Details tab to show all people from the Fall Enrollment
+                                    SELECT b.spbpers_pidm
+                                          ,a.spriden_id
+                                          ,b.spbpers_ssn                                          
+                                          ,d.shrdgmr_term_code_grad
+                                          ,a.ipeds_sex  
+                                          ,a.race_code
+                                          ,a.spbpers_dead_ind
+                                          ,a.sgbstdn_styp_code
+                                          ,d.shrdgmr_degc_code
+                                          ,CASE 
+                                              WHEN d.shrdgmr_degc_code LIKE 'A%' THEN 1
+                                              WHEN d.shrdgmr_degc_code LIKE 'C%' THEN 2
+                                              ELSE 0
+                                           END AS awlevel
+                                          ,d.shrdgmr_grst_code
+                                          ,e.rpratrm_fund_code AS pell_ind
+                                          ,f.rpratrm_fund_code AS dsub_ind
+                                          ,g.rpratrm_fund_code AS dunsub_ind
+                                    FROM ipeds_spring_coll_details a                                         
+                                        JOIN spbpers b ON (a.spriden_pidm = b.spbpers_pidm)
+                                        LEFT OUTER JOIN shrdgmr d ON (a.spriden_pidm = d.shrdgmr_pidm)
+                                        LEFT OUTER JOIN rpratrm e ON (a.spriden_pidm = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm f ON (a.spriden_pidm = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm g ON (a.spriden_pidm = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period = v_cohort_term)
+                                    WHERE a.reporting_term = v_cohort_term
+                                        AND a.cohort = 'FULL TIME, FIRST TIME, DEGREE SEEKING'                                        
+                               ),
+                 ranking AS (      
+                                SELECT z.*, ROW_NUMBER() OVER (PARTITION BY spbpers_pidm ORDER BY awlevel) AS degree_rk  
+                                FROM main_query z
+                            )
+            SELECT spbpers_pidm, spriden_id, spbpers_ssn, shrdgmr_term_code_grad, ipeds_sex, race_code, spbpers_dead_ind, sgbstdn_styp_code, shrdgmr_degc_code, awlevel, shrdgmr_grst_code, pell_ind, dsub_ind, dunsub_ind 
+            FROM ranking 
+            WHERE degree_rk = 1;
+                        
+            
+    /**********************************************************************/
+    /***************              Main Program              ***************/
+    /**********************************************************************/
+
+        BEGIN
+
+            --EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_grad_rates_details drop storage';
+            --EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_initial_revised_counts drop storage';
+            
+            v_initial_text := 'Initial cohort';
+            v_revised_text := 'Revised cohort';
+            
+            
+            INSERT INTO sis_apps.ipeds_winter_initial_revised_counts (cohort, nonres_m, nonres_f, hisp_m, hisp_f, nativ_m, nativ_f, asian_m, asian_f, afr_m, afr_f, 
+                                                                      pacif_m, pacif_f, cauc_m, cauc_f, multi_m, multi_f, unkn_m, unkn_f, cohort_term, reporting_term, date_added)
+            --VALUES ('Initial cohort', 0, 0, 9, 11, 0, 0, 0, 1, 5, 1, 0, 0, 86, 80, 0, 0, 19, 18, v_cohort_term, p_term, SYSDATE)  -- (201740) 
+            VALUES ('Initial cohort', 0, 0, 6, 10, 1, 0, 1, 0, 3, 18, 0, 0, 125, 89, 5, 1, 1, 4, v_cohort_term, p_term, SYSDATE) -- (201840)  -- use this when manually entering the numbers                       
+/*           
+            SELECT v_initial_text, nonres_m, nonres_f, 0, hisp_m, hisp_f, 0, nativ_m, nativ_f, 0, asian_m, asian_f, 0, afr_m, afr_f, 0, pacif_m, pacif_f, 0, cauc_m, cauc_f, 0, 
+                   multi_m, multi_f, 0, unkn_m, unkn_f, 0, v_cohort_term, p_term, SYSDATE
+            FROM sis_apps.ipeds_winter_initial_revised_counts
+            WHERE cohort_term = sis_apps.utl_term.udf_get_term_code_bkwd(v_cohort_term, 3)
+                AND cohort = v_revised_text;
+*/    
+;
+            INSERT INTO sis_apps.ipeds_winter_initial_revised_counts 
+            VALUES ('Revised cohort', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, v_cohort_term, p_term, SYSDATE);
+
+            COMMIT;
+                
+            DBMS_OUTPUT.PUT_LINE('----  Initial & Revised counts -----');
+                  
+            OPEN cur_grad_100_150;
+                LOOP
+                    v_spriden_pidm := '';
+                    v_spriden_id := '';
+                    v_spbpers_ssn := ''; 
+                    v_shrdgmr_term_code_grad := ''; 
+                    v_ipeds_sex := ''; 
+                    v_race_code := ''; 
+                    v_spbpers_dead_ind := ''; 
+                    v_sgbstdn_styp_code := ''; 
+                    v_shrdgmr_degc_code := ''; 
+                    v_awlevel := '';  
+                    v_shrdgmr_grst_code := '';                 
+                    v_pell_ind := '';  
+                    v_dsub_ind := '';  
+                    v_dunsub_ind := '';  
+
+                    FETCH cur_grad_100_150       
+                        INTO v_spriden_pidm,
+                             v_spriden_id,
+                             v_spbpers_ssn,
+                             v_shrdgmr_term_code_grad,
+                             v_ipeds_sex,
+                             v_race_code,                             
+                             v_spbpers_dead_ind,
+                             v_sgbstdn_styp_code,
+                             v_shrdgmr_degc_code,
+                             v_awlevel,
+                             v_shrdgmr_grst_code,
+                             v_pell_ind,
+                             v_dsub_ind,
+                             v_dunsub_ind;    
+                    EXIT WHEN cur_grad_100_150%NOTFOUND;   
+
+                   
+                    CASE
+                        WHEN v_shrdgmr_degc_code LIKE 'A%' AND v_shrdgmr_term_code_grad IN (p_term, v_spring_1, v_summer_1, v_fall_1, v_spring_2, v_summer_2) THEN v_rate := '100%';
+                        WHEN v_shrdgmr_degc_code LIKE 'C%' AND v_shrdgmr_term_code_grad IN (p_term, v_spring_1, v_summer_1) THEN v_rate := '100%';
+                        WHEN v_shrdgmr_degc_code LIKE 'A%' AND v_shrdgmr_term_code_grad IN (v_fall_2, v_spring_3, v_summer_3) THEN v_rate := '150%';
+                        WHEN v_shrdgmr_degc_code LIKE 'C%' AND v_shrdgmr_term_code_grad IN (v_fall_1) THEN v_rate := '150%';
+                        -- *** 
+                        WHEN v_shrdgmr_degc_code LIKE 'A%' AND v_shrdgmr_term_code_grad IN (v_fall_4, v_spring_4, v_summer_4) THEN v_rate := '200%';
+                        WHEN v_shrdgmr_degc_code LIKE 'C%' AND v_shrdgmr_term_code_grad IN (v_fall_4, v_spring_4, v_summer_4) THEN v_rate := '200%';
+                        ELSE v_rate := 'UNKNOWN';
+                    END CASE;
+                                                
+                    -- export this table to the ALL DETAILS tab
+                    -- query it for rate != 'UNKNOWN' and export to 100% & 150% DETAILS tab
+                    INSERT INTO ipeds_winter_grad_rates_details
+                        (spriden_pidm, spriden_id, spbpers_ssn, shrdgmr_term_code_grad, ipeds_sex, race_code, spbpers_dead_ind, sgbstdn_styp_code,
+                         shrdgmr_degc_code, shrdgmr_grst_code, pell_ind, dsub_ind, dunsub_ind, rate, cohort_term, reporting_term, date_added)
+                    VALUES 
+                        (v_spriden_pidm, v_spriden_id, v_spbpers_ssn, v_shrdgmr_term_code_grad, v_ipeds_sex, v_race_code, v_spbpers_dead_ind, v_sgbstdn_styp_code,
+                         v_shrdgmr_degc_code, v_shrdgmr_grst_code, v_pell_ind, v_dsub_ind, v_dunsub_ind, v_rate, v_cohort_term, p_term, SYSDATE);
+                    COMMIT;
+
+
+                    IF v_ipeds_sex = 'M' THEN
+                        IF v_race_code = 'N' THEN
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET nonres_m = nonres_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'H' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET hisp_m = hisp_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'I' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET nativ_m = nativ_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'O' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET asian_m = asian_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'B' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET afr_m = afr_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term; 
+                        ELSIF v_race_code = 'P' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET pacif_m = pacif_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'C' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET cauc_m = cauc_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term; 
+                        ELSIF v_race_code = 'M' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET multi_m = multi_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'U' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET unkn_m = unkn_m + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term; 
+                        END IF;
+                    ELSIF v_ipeds_sex = 'F' THEN
+                        IF v_race_code = 'N' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET nonres_f = nonres_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'H' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET hisp_f = hisp_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'I' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET nativ_f = nativ_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'O' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET asian_f = asian_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'B' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET afr_f = afr_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term; 
+                        ELSIF v_race_code = 'P' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET pacif_f = pacif_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'C' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET cauc_f = cauc_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term; 
+                        ELSIF v_race_code = 'M' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET multi_f = multi_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term;
+                        ELSIF v_race_code = 'U' THEN 
+                            UPDATE sis_apps.ipeds_winter_initial_revised_counts SET unkn_f = unkn_f + 1 WHERE cohort = v_revised_text AND cohort_term = v_cohort_term; 
+                        END IF;
+                    ELSE DBMS_OUTPUT.PUT_LINE('PIDM ' || v_spriden_pidm || ' WAS NOT COUNTED');   
+                    COMMIT;
+                      
+                    END IF;                                             
+                    
+                END LOOP;   
+                            
+            CLOSE cur_grad_100_150;
+                        
+            DBMS_OUTPUT.PUT_LINE('--------------------------------------');  
+
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+
+    END PZ_WINTER_GRADUATION_RATES;
+
+
+    PROCEDURE PZ_WINTER_200 (p_term IN varchar2) IS
+    /*=============================================================================
+            AUTHOR: Bob Barringer
+
+       DESCRIPTION: IPEDS Graduation Rates 200 survey component
+
+    ==============================================================================*/  
+     
+        v_spbpers_pidm                spbpers.spbpers_pidm%TYPE; 
+        v_spriden_id                  spriden.spriden_id%TYPE;
+        v_spbpers_ssn                 spbpers.spbpers_ssn%TYPE;  
+        v_shrdgmr_term_code_grad      shrdgmr.shrdgmr_term_code_grad%TYPE;
+        v_ipeds_sex                   spbpers.spbpers_sex%TYPE;
+        v_race_code                   varchar2(1);
+        v_spbpers_dead_ind            spbpers.spbpers_dead_ind%TYPE;   
+        v_sgbstdn_styp_code           sgbstdn.sgbstdn_styp_code%TYPE;  
+        v_shrdgmr_degc_code           shrdgmr.shrdgmr_degc_code%TYPE;  
+        v_awlevel                     number;
+        v_shrdgmr_grst_code           shrdgmr.shrdgmr_grst_code%TYPE;        
+        v_rate                        varchar2(10);
+        v_pell_ind                    varchar2(10);
+        v_dsub_ind                    varchar2(10);  
+        v_dunsub_ind                  varchar2(10);        
+        v_degree_rk                   number;
+        v_cohort_term                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 12);
+        v_spring_1                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 4);
+        v_summer_1                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 5);
+        v_fall_1                      varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 9);
+        v_spring_2                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 10);
+        v_summer_2                    varchar2(6) := sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 11);
+
+        
+        CURSOR cur_grad_200 IS  
+            WITH main_query AS (
+                                    SELECT b.spbpers_pidm
+                                          ,a.tnumber AS spriden_id
+                                          ,b.spbpers_ssn                                          
+                                          ,d.shrdgmr_term_code_grad
+                                          ,NVL(a.spbpers_sex, 'N') AS spbpers_sex  -- pulling in spbpers_sex here because we are using a table that predates ipeds_sex
+                                          ,a.race_code
+                                          ,a.spbpers_dead_ind
+                                          ,a.sgbstdn_styp_code
+                                          ,d.shrdgmr_degc_code
+                                          ,CASE 
+                                              WHEN d.shrdgmr_degc_code LIKE 'A%' THEN 1
+                                              WHEN d.shrdgmr_degc_code LIKE 'C%' THEN 2
+                                              ELSE 0
+                                           END AS awlevel
+                                          ,d.shrdgmr_grst_code
+                                          ,e.rpratrm_fund_code AS pell_ind
+                                          ,f.rpratrm_fund_code AS dsub_ind
+                                          ,g.rpratrm_fund_code AS dunsub_ind
+                                    FROM ipeds_201740_deg_cohorts a                                         
+                                        JOIN spbpers b ON (a.pidm = b.spbpers_pidm)                                        
+                                        LEFT OUTER JOIN shrdgmr d ON (a.pidm = d.shrdgmr_pidm)
+                                        LEFT OUTER JOIN rpratrm e ON (a.pidm = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm f ON (a.pidm = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm g ON (a.pidm = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period = v_cohort_term)
+                                    WHERE a.time_status = 'FT'                              
+                               ),
+                 ranking AS (      
+                                SELECT z.*, ROW_NUMBER() OVER (PARTITION BY spbpers_pidm ORDER BY awlevel) AS degree_rk  
+                                FROM main_query z
+                            )
+            SELECT * FROM ranking WHERE degree_rk = 1;           
+            
+    /**********************************************************************/
+    /***************              Main Program              ***************/
+    /**********************************************************************/
+
+        BEGIN
+
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_200_details drop storage';
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_200_counts drop storage';
+       
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('1. Revised cohort', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('2. Exclusions within 150%', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('3. Adjusted cohort 150%', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('4. Number of students in the cohort who completed a program within 100% of normal time to completion', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('5. Number of students in the cohort who completed a program within 150% of normal time to completion', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('6. Additional exclusions (between 151% and 200% of normal time)', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('7. Adjusted cohort 200% (line 3 - line 6)', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('8. Number of students in the cohort who completed a program between 151% and 200% of normal time to completion', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('9. Still enrolled as of 200% of normal time to completion', 0, 0, v_cohort_term, p_term, SYSDATE);
+            INSERT INTO sis_apps.ipeds_winter_200_counts VALUES('10. Total completers within 200% of normal time (line 5 + line 8)', 0, 0, v_cohort_term, p_term, SYSDATE);
+            COMMIT;            
+            
+            
+            OPEN cur_grad_200;
+                LOOP
+                    v_spbpers_pidm := '';
+                    v_spriden_id := '';
+                    v_spbpers_ssn := ''; 
+                    v_shrdgmr_term_code_grad := ''; 
+                    v_ipeds_sex := ''; 
+                    v_race_code := ''; 
+                    v_spbpers_dead_ind := ''; 
+                    v_sgbstdn_styp_code := ''; 
+                    v_shrdgmr_degc_code := ''; 
+                    v_awlevel := '';  
+                    v_shrdgmr_grst_code := '';                 
+                    v_pell_ind := '';  
+                    v_dsub_ind := '';  
+                    v_dunsub_ind := '';  
+                    v_degree_rk := '';
+
+                    FETCH cur_grad_200       
+                        INTO v_spbpers_pidm,
+                             v_spriden_id,
+                             v_spbpers_ssn,
+                             v_shrdgmr_term_code_grad,
+                             v_ipeds_sex,
+                             v_race_code,                             
+                             v_spbpers_dead_ind,
+                             v_sgbstdn_styp_code,
+                             v_shrdgmr_degc_code,
+                             v_awlevel,
+                             v_shrdgmr_grst_code,
+                             v_pell_ind,
+                             v_dsub_ind,
+                             v_dunsub_ind,
+                             v_degree_rk;    
+                    EXIT WHEN cur_grad_200%NOTFOUND;   
+                                                            
+          
+                    
+                ---- unknown genders ----
+                    IF v_ipeds_sex = 'N' THEN  ----- ask Sherri or Terra how to count these people
+                            DBMS_OUTPUT.PUT_LINE('PIDM ' || v_spbpers_pidm || ' / ' || v_spriden_id || ' has an unknown gender'); 
+                    END IF; 
+                    
+/*
+IPEDS does not have a way to count people with unknown genders. We had 5 for 202040 Fall Enrollment. 
+Sherri looked at their profiles and said to count them this way. This will need to be done each year. 
+*/ 
+/*                
+                    CASE 
+                        WHEN v_spriden_id IN ('T00214190', 'T00062576') THEN v_ipeds_sex := 'F';
+                        WHEN v_spriden_id IN ('T00211484', 'T00201747', 'T00214028') THEN v_ipeds_sex := 'M';
+                        ELSE NULL;
+                    END CASE;
+*/                    
+                ------------------------ 
+
+                                           
+                    CASE
+                        WHEN v_shrdgmr_degc_code LIKE 'C%' AND v_shrdgmr_term_code_grad IN (v_spring_1, v_summer_1) THEN v_rate := '200%';
+                        WHEN v_shrdgmr_degc_code LIKE 'A%' AND v_shrdgmr_term_code_grad IN (v_fall_1, v_spring_2, v_summer_2) THEN v_rate := '200%';
+                        ELSE v_rate := 'UNKNOWN';
+                    END CASE;
+                
+                    IF v_rate = '200%' THEN
+                        INSERT INTO ipeds_winter_200_details
+                            (spbpers_pidm, spriden_id, spbpers_ssn, shrdgmr_term_code_grad, ipeds_sex, race_code, spbpers_dead_ind, sgbstdn_styp_code,
+                             shrdgmr_degc_code, shrdgmr_grst_code, pell_ind, dsub_ind, dunsub_ind, rate, cohort_term, reporting_term, date_added)
+                        VALUES 
+                            (v_spbpers_pidm, v_spriden_id, v_spbpers_ssn, v_shrdgmr_term_code_grad, v_ipeds_sex, v_race_code, v_spbpers_dead_ind, v_sgbstdn_styp_code,
+                             v_shrdgmr_degc_code, v_shrdgmr_grst_code, v_pell_ind, v_dsub_ind, v_dunsub_ind, v_rate, v_cohort_term, p_term, SYSDATE);
+                        COMMIT;                        
+                    END IF;                                        
+
+                END LOOP;  
+                
+                UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_201740_deg_cohorts WHERE time_status = 'FT') WHERE line LIKE '1.%' AND cohort_term = v_cohort_term;
+                UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_201740_deg_cohorts WHERE time_status = 'FT' AND spbpers_dead_ind IS NOT NULL) WHERE line LIKE '6.%' AND cohort_term = v_cohort_term;
+                UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_winter_200_details WHERE cohort_term = v_cohort_term) WHERE line LIKE '8.%' AND cohort_term = v_cohort_term;
+                COMMIT;
+                              
+            CLOSE cur_grad_200;
+            
+
+    END PZ_WINTER_200;    
+   
+
+    PROCEDURE PZ_WINTER_STILL_ENROLLED (p_term IN varchar2) IS
+    /*=============================================================================
+            AUTHOR: Bob Barringer
+
+       DESCRIPTION: Creates the detail records for the Winter Collection students that did not graduate within 100%, 150%, or 200% but did enroll in the next term
+
+    ==============================================================================*/  
+                 
+        v_spbpers_pidm                spbpers.spbpers_pidm%TYPE; 
+        v_spriden_id                  spriden.spriden_id%TYPE;
+        v_spbpers_ssn                 spbpers.spbpers_ssn%TYPE;  
+        v_sfrstcr_term_code           sfrstcr.sfrstcr_term_code%TYPE; 
+        v_sgbstdn_term_code_eff       sgbstdn.sgbstdn_term_code_eff%TYPE; 
+        v_ipeds_sex                   spbpers.spbpers_sex%TYPE;   
+        v_race_code                   varchar2(1);
+        v_spbpers_dead_ind            spbpers.spbpers_dead_ind%TYPE;   
+        v_sgbstdn_styp_code           sgbstdn.sgbstdn_styp_code%TYPE;  
+        v_sgbstdn_degc_code           sgbstdn.sgbstdn_degc_code_1%TYPE;  
+        v_awlevel                     number;
+        v_next_term                   varchar2(11);
+        v_is_enrolled                 varchar2(3);
+        v_pell_ind                    varchar2(10);
+        v_dsub_ind                    varchar2(10);  
+        v_dunsub_ind                  varchar2(10);
+        v_rank                        number;
+        v_cohort_term                 varchar2(6); 
+
+
+        CURSOR cur_still_enrolled_100_150 IS  
+            WITH main_query AS (
+                                    SELECT b.spbpers_pidm 
+                                          ,a.spriden_id
+                                          ,b.spbpers_ssn                                          
+                                          ,a.sfrstcr_term_code
+                                          ,a.ipeds_sex  
+                                          ,a.race_code
+                                          ,a.spbpers_dead_ind
+                                          ,a.sgbstdn_styp_code
+                                          ,d.sgbstdn_degc_code_1
+                                          ,CASE 
+                                              WHEN d.sgbstdn_degc_code_1 LIKE 'A%' THEN 1
+                                              WHEN d.sgbstdn_degc_code_1 LIKE 'C%' THEN 2
+                                              ELSE 0
+                                           END AS awlevel
+                                          ,CASE -- this is the term following 150%
+                                              WHEN d.sgbstdn_degc_code_1 LIKE 'A%' THEN sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 9)
+                                              WHEN d.sgbstdn_degc_code_1 LIKE 'C%' THEN sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 4)
+                                              ELSE 'ERROR'  -- most of the records with this ERROR will be because they took FOC courses
+                                           END AS next_term
+                                          ,e.rpratrm_fund_code AS pell_ind
+                                          ,f.rpratrm_fund_code AS dsub_ind
+                                          ,g.rpratrm_fund_code AS dunsub_ind
+                                    FROM ipeds_spring_coll_details a                                         
+                                        JOIN spbpers b ON (a.spriden_pidm = b.spbpers_pidm)
+                                        LEFT OUTER JOIN sgbstdn d ON (a.spriden_pidm = d.sgbstdn_pidm AND a.reporting_term = d.sgbstdn_term_code_eff)
+                                        LEFT OUTER JOIN rpratrm e ON (a.spriden_pidm = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm f ON (a.spriden_pidm = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm g ON (a.spriden_pidm = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period = v_cohort_term)
+                                    WHERE a.reporting_term = v_cohort_term
+                                        AND a.cohort = 'FULL TIME, FIRST TIME, DEGREE SEEKING'    
+                                        AND NOT EXISTS (   -- this filters out people who did graduate with 100% or 150%
+                                                            SELECT 1 
+                                                            FROM ipeds_winter_grad_rates_details z
+                                                            WHERE b.spbpers_pidm = z.spriden_pidm
+                                                       )                                                         
+                               ),
+                 ranking AS (      
+                                SELECT z.*, ROW_NUMBER() OVER (PARTITION BY spbpers_pidm ORDER BY awlevel) AS rk  
+                                FROM main_query z
+                            )
+            SELECT * FROM ranking z WHERE rk = 1;
+
+                         
+        CURSOR cur_still_enrolled_200 IS     
+            WITH main_query AS (
+                                    SELECT b.spbpers_pidm
+                                          ,a.tnumber AS spriden_id
+                                          ,b.spbpers_ssn
+                                          ,d.sgbstdn_term_code_eff
+                                          ,NVL(a.spbpers_sex, 'N') AS spbpers_sex   -- pulling in spbpers_sex here because we are using a table that predates ipeds_sex
+                                          ,a.race_code                                          
+                                          ,a.spbpers_dead_ind
+                                          ,a.sgbstdn_styp_code
+                                          ,d.sgbstdn_degc_code_1
+                                          ,CASE 
+                                              WHEN d.sgbstdn_degc_code_1 LIKE 'A%' THEN 1
+                                              WHEN d.sgbstdn_degc_code_1 LIKE 'C%' THEN 2
+                                              ELSE 0
+                                           END AS awlevel
+                                          ,CASE -- this is the term following 200%
+                                             WHEN d.sgbstdn_degc_code_1 LIKE 'A%' THEN sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 9)
+                                             WHEN d.sgbstdn_degc_code_1 LIKE 'C%' THEN sis_apps.utl_term.udf_get_term_code_fwd (v_cohort_term, 4)
+                                             ELSE 'ERROR'  -- these people either graduated in a previous year or didn't register in v_next_term, we don't count them either way  
+                                           END AS next_term 
+                                          ,e.rpratrm_fund_code AS pell_ind
+                                          ,f.rpratrm_fund_code AS dsub_ind
+                                          ,g.rpratrm_fund_code AS dunsub_ind
+                                    FROM ipeds_201740_deg_cohorts a                                         
+                                        JOIN spbpers b ON (a.pidm = b.spbpers_pidm)
+                                        LEFT OUTER JOIN sgbstdn d ON (a.pidm = d.sgbstdn_pidm AND v_cohort_term = d.sgbstdn_term_code_eff)
+                                        LEFT OUTER JOIN rpratrm e ON (a.pidm = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm f ON (a.pidm = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm g ON (a.pidm = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period =  v_cohort_term)
+                                    WHERE a.time_status = 'FT'
+                                        AND NOT EXISTS (   -- this filters out people who did graduate with 200%
+                                                            SELECT 1 
+                                                            FROM ipeds_winter_200_details z
+                                                            WHERE b.spbpers_pidm = z.spbpers_pidm
+                                                                AND z.reporting_term = p_term
+                                                       )                                                 
+                               ),
+                 ranking AS (      
+                                SELECT z.*, ROW_NUMBER() OVER (PARTITION BY spbpers_pidm ORDER BY awlevel) AS degree_rk  
+                                FROM main_query z
+                            )
+            SELECT * FROM ranking WHERE degree_rk = 1;     
+            
+    /**********************************************************************/
+    /***************              Main Program              ***************/
+    /**********************************************************************/
+    
+        BEGIN
+
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_still_enrolled_100_150_details drop storage';
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_still_enrolled_200_details drop storage';
+            
+            v_cohort_term := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 9);            
+                   
+            OPEN cur_still_enrolled_100_150;
+                LOOP
+                    v_spbpers_pidm := '';
+                    v_spriden_id := '';
+                    v_spbpers_ssn := '';
+                    v_sfrstcr_term_code := '';
+                    v_ipeds_sex := '';
+                    v_race_code := '';
+                    v_spbpers_dead_ind := '';
+                    v_sgbstdn_styp_code := '';
+                    v_sgbstdn_degc_code := '';
+                    v_awlevel := '';
+                    v_next_term := '';
+                    v_pell_ind := '';
+                    v_dsub_ind := '';
+                    v_dunsub_ind := '';
+                    v_rank := '';
+                    v_is_enrolled := '';
+                    
+                    FETCH cur_still_enrolled_100_150
+                        INTO v_spbpers_pidm,
+                             v_spriden_id,
+                             v_spbpers_ssn,
+                             v_sfrstcr_term_code,
+                             v_ipeds_sex,
+                             v_race_code,
+                             v_spbpers_dead_ind,
+                             v_sgbstdn_styp_code,
+                             v_sgbstdn_degc_code,
+                             v_awlevel,
+                             v_next_term,
+                             v_pell_ind,
+                             v_dsub_ind,
+                             v_dunsub_ind,
+                             v_rank;
+                    EXIT WHEN cur_still_enrolled_100_150%NOTFOUND;   
+                    
+                    BEGIN
+                        SELECT CASE
+                                    WHEN EXISTS(
+                                                   SELECT 1 
+                                                   FROM sfrstcr s
+                                                   WHERE s.sfrstcr_pidm = v_spbpers_pidm 
+                                                       AND s.sfrstcr_rsts_code LIKE 'R%'
+                                                       AND s.sfrstcr_term_code = v_next_term
+                                               )
+                                    THEN 'Yes'
+                                    ELSE 'No'
+                               END
+                        INTO v_is_enrolled
+                        FROM dual;
+                    END;
+                    
+                        INSERT INTO ipeds_winter_still_enrolled_100_150_details
+                            (spbpers_pidm, spriden_id, spbpers_ssn, sfrstcr_term_code, ipeds_sex, race_code, spbpers_dead_ind, sgbstdn_styp_code, sgbstdn_degc_code, 
+                             awlevel, next_term, is_enrolled, pell_ind, dsub_ind, dunsub_ind, cohort_term, reporting_term, date_added)
+                        VALUES 
+                            (v_spbpers_pidm, v_spriden_id, v_spbpers_ssn, v_sfrstcr_term_code, v_ipeds_sex, v_race_code, v_spbpers_dead_ind, v_sgbstdn_styp_code, v_sgbstdn_degc_code, 
+                             v_awlevel, v_next_term, v_is_enrolled, v_pell_ind, v_dsub_ind, v_dunsub_ind, v_cohort_term, p_term, SYSDATE);
+                        COMMIT;
+                                                 
+                END LOOP;   
+            CLOSE cur_still_enrolled_100_150;
+
+
+            v_cohort_term := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 12);
+            
+            OPEN cur_still_enrolled_200;
+                LOOP
+                    v_spbpers_pidm := '';
+                    v_spriden_id := '';
+                    v_spbpers_ssn := ''; 
+                    v_sgbstdn_term_code_eff := ''; 
+                    v_ipeds_sex := ''; 
+                    v_race_code := ''; 
+                    v_spbpers_dead_ind := ''; 
+                    v_sgbstdn_styp_code := ''; 
+                    v_sgbstdn_degc_code := ''; 
+                    v_awlevel := '';  
+                    v_next_term :='';
+                    v_pell_ind := '';  
+                    v_dsub_ind := '';  
+                    v_dunsub_ind := '';   
+                    v_rank := '';   
+                    v_is_enrolled := '';                  
+                    
+                    FETCH cur_still_enrolled_200       
+                        INTO v_spbpers_pidm,
+                             v_spriden_id,
+                             v_spbpers_ssn,
+                             v_sgbstdn_term_code_eff,
+                             v_ipeds_sex,
+                             v_race_code,
+                             v_spbpers_dead_ind,
+                             v_sgbstdn_styp_code,
+                             v_sgbstdn_degc_code,
+                             v_awlevel,
+                             v_next_term,
+                             v_pell_ind,
+                             v_dsub_ind,
+                             v_dunsub_ind,
+                             v_rank;   
+                    EXIT WHEN cur_still_enrolled_200%NOTFOUND;   
+
+                    BEGIN
+                        SELECT CASE
+                                    WHEN EXISTS(
+                                                   SELECT 1 
+                                                   FROM sfrstcr s
+                                                   WHERE v_spbpers_pidm = s.sfrstcr_pidm 
+                                                       AND s.sfrstcr_rsts_code LIKE 'R%'
+                                                       AND s.sfrstcr_term_code = v_next_term
+                                               )
+                                    THEN 'Yes'
+                                    ELSE 'No'
+                               END
+                        INTO v_is_enrolled
+                        FROM dual;
+                    END;
+
+                    IF v_next_term != 'ERROR' THEN 
+                        INSERT INTO ipeds_winter_still_enrolled_200_details
+                            (spbpers_pidm, spriden_id, spbpers_ssn, sgbstdn_term_code_eff, ipeds_sex, race_code, spbpers_dead_ind, sgbstdn_styp_code, sgbstdn_degc_code, 
+                             awlevel, next_term, is_enrolled, pell_ind, dsub_ind, dunsub_ind, cohort_term, reporting_term, date_added)
+                        VALUES 
+                            (v_spbpers_pidm, v_spriden_id, v_spbpers_ssn, v_sgbstdn_term_code_eff, v_ipeds_sex, v_race_code, v_spbpers_dead_ind, v_sgbstdn_styp_code, v_sgbstdn_degc_code, 
+                             v_awlevel, v_next_term, v_is_enrolled, v_pell_ind, v_dsub_ind, v_dunsub_ind, v_cohort_term, p_term, SYSDATE);
+                        COMMIT;                    
+                    END IF;
+                              
+                END LOOP;   
+                
+                UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_winter_still_enrolled_200_details WHERE cohort_term = v_cohort_term AND is_enrolled = 'Yes') WHERE line LIKE '9.%' AND cohort_term = v_cohort_term;
+                COMMIT;
+                
+            CLOSE cur_still_enrolled_200;
+        
+            
+    END PZ_WINTER_STILL_ENROLLED;
+
+
+    PROCEDURE PZ_WINTER_COMPLETERS_WITHIN_150 (p_term IN varchar2) IS
+    /*=============================================================================
+            AUTHOR: Bob Barringer
+
+       DESCRIPTION: 
+
+    ==============================================================================*/  
+         
+        v_spriden_pidm                sis_apps.ipeds_winter_grad_rates_details.spriden_pidm%TYPE; 
+        v_spriden_id                  sis_apps.ipeds_winter_grad_rates_details.spriden_id%TYPE; 
+        v_ipeds_sex                   sis_apps.ipeds_winter_grad_rates_details.ipeds_sex%TYPE; 
+        v_race_code                   sis_apps.ipeds_winter_grad_rates_details.race_code%TYPE; 
+        v_shrdgmr_degc_code           sis_apps.ipeds_winter_grad_rates_details.shrdgmr_degc_code%TYPE; 
+        v_cohort_term                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 9);
+        
+        
+        CURSOR cur_completers_150 IS     
+            SELECT spriden_pidm, spriden_id, ipeds_sex, race_code, shrdgmr_degc_code 
+            FROM ipeds_winter_grad_rates_details 
+            WHERE rate = '150%' 
+                AND reporting_term = p_term 
+                AND spbpers_dead_ind IS NULL;
+       
+    /**********************************************************************/
+    /***************              Main Program              ***************/
+    /**********************************************************************/
+
+        BEGIN
+
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_completers_150_counts drop storage';
+       
+            INSERT INTO ipeds_winter_completers_150_counts (cohort, nonres_m, nonres_f, hisp_m, hisp_f, nativ_m, nativ_f, asian_m, asian_f, afr_m, afr_f, 
+                                                            pacif_m, pacif_f, cauc_m, cauc_f, multi_m, multi_f, unkn_m, unkn_f, cohort_term, reporting_term, date_added )
+            VALUES ('Column 10', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, v_cohort_term, p_term, SYSDATE);                
+
+            INSERT INTO ipeds_winter_completers_150_counts (cohort, nonres_m, nonres_f, hisp_m, hisp_f, nativ_m, nativ_f, asian_m, asian_f, afr_m, afr_f, 
+                                                            pacif_m, pacif_f, cauc_m, cauc_f, multi_m, multi_f, unkn_m, unkn_f, cohort_term, reporting_term, date_added )
+            VALUES ('Column 11', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, v_cohort_term, p_term, SYSDATE);                
+
+            INSERT INTO ipeds_winter_completers_150_counts (cohort, nonres_m, nonres_f, hisp_m, hisp_f, nativ_m, nativ_f, asian_m, asian_f, afr_m, afr_f, 
+                                                            pacif_m, pacif_f, cauc_m, cauc_f, multi_m, multi_f, unkn_m, unkn_f, cohort_term, reporting_term, date_added )
+            VALUES ('Column 12', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, v_cohort_term, p_term, SYSDATE);                
+
+            INSERT INTO ipeds_winter_completers_150_counts (cohort, nonres_m, nonres_f, hisp_m, hisp_f, nativ_m, nativ_f, asian_m, asian_f, afr_m, afr_f, 
+                                                            pacif_m, pacif_f, cauc_m, cauc_f, multi_m, multi_f, unkn_m, unkn_f, cohort_term, reporting_term, date_added )
+            VALUES ('Column 29', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, v_cohort_term, p_term, SYSDATE);                
+
+            COMMIT;            
+            
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET nonres_m = (SELECT nonres_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET nonres_f = (SELECT nonres_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET hisp_m = (SELECT hisp_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET hisp_f = (SELECT hisp_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET nativ_m = (SELECT nativ_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET nativ_f = (SELECT nativ_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET asian_m = (SELECT asian_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET asian_f = (SELECT asian_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET afr_m = (SELECT afr_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET afr_f = (SELECT afr_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET pacif_m = (SELECT pacif_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET pacif_f = (SELECT pacif_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET cauc_m = (SELECT cauc_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET cauc_f = (SELECT cauc_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET multi_m = (SELECT multi_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET multi_f = (SELECT multi_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET unkn_m = (SELECT unkn_m FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            UPDATE ipeds_winter_completers_150_counts 
+            SET unkn_f = (SELECT unkn_f FROM ipeds_winter_initial_revised_counts WHERE cohort = 'Revised cohort' AND reporting_term = p_term) 
+            WHERE cohort = 'Column 10' AND reporting_term = p_term;
+            
+            COMMIT;
+            
+            
+            OPEN cur_completers_150;
+                LOOP
+                    v_spriden_pidm := '';      
+                    v_spriden_id := '';        
+                    v_ipeds_sex := '';         
+                    v_race_code := '';         
+                    v_shrdgmr_degc_code := '';    
+                
+                    FETCH cur_completers_150       
+                        INTO v_spriden_pidm,
+                             v_spriden_id,       
+                             v_ipeds_sex,        
+                             v_race_code,        
+                             v_shrdgmr_degc_code;    
+                    EXIT WHEN cur_completers_150%NOTFOUND;                                                                                   
+                                                           
+                    IF v_ipeds_sex = 'M' THEN
+                        IF v_shrdgmr_degc_code LIKE 'C%' THEN
+                            IF v_race_code = 'N' THEN
+                                UPDATE ipeds_winter_completers_150_counts SET nonres_m = nonres_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'H' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET hisp_m = hisp_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'I' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET nativ_m = nativ_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;  
+                            ELSIF v_race_code = 'O' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET asian_m = asian_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'B' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET afr_m = afr_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'P' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET pacif_m = pacif_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'C' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET cauc_m = cauc_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'M' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET multi_m = multi_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'U' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET unkn_m = unkn_m + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            END IF; 
+                        ELSIF v_shrdgmr_degc_code LIKE 'A%' THEN
+                            IF v_race_code = 'N' THEN
+                                UPDATE ipeds_winter_completers_150_counts SET nonres_m = nonres_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'H' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET hisp_m = hisp_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'I' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET nativ_m = nativ_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;  
+                            ELSIF v_race_code = 'O' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET asian_m = asian_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'B' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET afr_m = afr_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'P' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET pacif_m = pacif_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'C' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET cauc_m = cauc_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'M' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET multi_m = multi_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'U' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET unkn_m = unkn_m + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;
+                    ELSIF v_ipeds_sex = 'F' THEN
+                        IF v_shrdgmr_degc_code LIKE 'C%' THEN
+                            IF v_race_code = 'N' THEN
+                                UPDATE ipeds_winter_completers_150_counts SET nonres_f = nonres_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'H' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET hisp_f = hisp_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'I' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET nativ_f = nativ_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;  
+                            ELSIF v_race_code = 'O' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET asian_f = asian_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'B' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET afr_f = afr_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'P' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET pacif_f = pacif_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'C' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET cauc_f = cauc_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'M' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET multi_f = multi_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'U' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET unkn_f = unkn_f + 1 WHERE cohort = 'Column 11' AND reporting_term = p_term;
+                            END IF; 
+                        ELSIF v_shrdgmr_degc_code LIKE 'A%' THEN
+                            IF v_race_code = 'N' THEN
+                                UPDATE ipeds_winter_completers_150_counts SET nonres_f = nonres_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'H' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET hisp_f = hisp_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'I' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET nativ_f = nativ_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;  
+                            ELSIF v_race_code = 'O' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET asian_f = asian_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'B' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET afr_f = afr_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'P' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET pacif_f = pacif_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'C' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET cauc_f = cauc_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'M' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET multi_f = multi_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            ELSIF v_race_code = 'U' THEN 
+                                UPDATE ipeds_winter_completers_150_counts SET unkn_f = unkn_f + 1 WHERE cohort = 'Column 12' AND reporting_term = p_term;
+                            END IF; 
+                        END IF;                        
+                    END IF;  
+                                 
+                    COMMIT;
+
+                END LOOP; 
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET nonres_m = (
+                                (SELECT nonres_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT nonres_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET hisp_m = (
+                                (SELECT hisp_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT hisp_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET nativ_m = (
+                                (SELECT nativ_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT nativ_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET asian_m = (
+                                (SELECT asian_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT asian_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET afr_m = (
+                                (SELECT afr_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT afr_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET pacif_m = (
+                                (SELECT pacif_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT pacif_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET cauc_m = (
+                                (SELECT cauc_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT cauc_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET multi_m = (
+                                (SELECT multi_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT multi_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET unkn_m = (
+                                (SELECT unkn_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT unkn_m FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;                                
+
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET nonres_f = (
+                                (SELECT nonres_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT nonres_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET hisp_f = (
+                                (SELECT hisp_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT hisp_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET nativ_f = (
+                                (SELECT nativ_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT nativ_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET asian_f = (
+                                (SELECT asian_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT asian_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET afr_f = (
+                                (SELECT afr_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT afr_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET pacif_f = (
+                                (SELECT pacif_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT pacif_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET cauc_f = (
+                                (SELECT cauc_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT cauc_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                
+                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET multi_f = (
+                                (SELECT multi_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT multi_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+                COMMIT; 
+                
+                                UPDATE sis_apps.ipeds_winter_completers_150_counts 
+                SET unkn_f = (
+                                (SELECT unkn_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 11' AND reporting_term = p_term) + 
+                                (SELECT unkn_f FROM ipeds_winter_completers_150_counts WHERE cohort = 'Column 12' AND reporting_term = p_term)
+                             ) 
+                WHERE cohort = 'Column 29' 
+                    AND reporting_term = p_term;
+
+                COMMIT; 
+                                              
+            CLOSE cur_completers_150;            
+           
+    END PZ_WINTER_COMPLETERS_WITHIN_150;    
+
+
+
+    PROCEDURE PZ_WINTER_COMPLETERS_WITHIN_100 (p_term IN varchar2) IS
+    /*=============================================================================
+            AUTHOR: JD Perry
+
+       DESCRIPTION: 
+
+    ==============================================================================*/  
+ 
+        v_cohort_term                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 9);
+        v_revised_cohort              number;
+        v_exclusions                  number;
+        v_column55                    number;
+        v_column56                    number;
+        v_column57                    number;
+
+        BEGIN
+
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_completers_100_counts drop storage';
+            
+            INSERT INTO sis_apps.ipeds_winter_completers_100_counts (line, revised_cohort, exclusions, column_55, column_56, column_57, cohort_term, reporting_term, date_added)
+            VALUES ('Total men + women', 0, 0, 0, 0, 0, v_cohort_term, p_term, SYSDATE);  
+            
+            SELECT COUNT(*) INTO v_revised_cohort FROM ipeds_winter_grad_rates_details WHERE cohort_term = v_cohort_term; 
+            
+            SELECT COUNT(*) INTO v_exclusions FROM ipeds_winter_grad_rates_details WHERE cohort_term = v_cohort_term AND spbpers_dead_ind IS NOT NULL;
+            
+            SELECT COUNT(*) INTO v_column55 FROM ipeds_winter_grad_rates_details WHERE rate = '100%' AND cohort_term = v_cohort_term AND shrdgmr_degc_code LIKE 'C%';
+            
+            SELECT COUNT(*) INTO v_column56 FROM ipeds_winter_grad_rates_details WHERE rate = '100%' AND cohort_term = v_cohort_term AND shrdgmr_degc_code LIKE 'A%';
+            
+            SELECT COUNT(*) INTO v_column57 FROM ipeds_winter_grad_rates_details WHERE rate = '100%' AND cohort_term = v_cohort_term;
+            
+            
+            UPDATE sis_apps.ipeds_winter_completers_100_counts
+            SET revised_cohort = v_revised_cohort
+            WHERE cohort_term = v_cohort_term;
+            
+            UPDATE sis_apps.ipeds_winter_completers_100_counts
+            SET exclusions = v_exclusions
+            WHERE cohort_term = v_cohort_term;
+            
+            UPDATE sis_apps.ipeds_winter_completers_100_counts
+            SET column_55 = v_column55
+            WHERE cohort_term = v_cohort_term;
+            
+            UPDATE sis_apps.ipeds_winter_completers_100_counts
+            SET column_56 = v_column56
+            WHERE cohort_term = v_cohort_term;
+            
+            UPDATE sis_apps.ipeds_winter_completers_100_counts
+            SET column_57 = v_column57
+            WHERE cohort_term = v_cohort_term;
+        
+            COMMIT;
+            
+    END PZ_WINTER_COMPLETERS_WITHIN_100;
+    
+    
+    PROCEDURE PZ_WINTER_PELL_RECIPIENTS (p_term IN varchar2) IS
+    /*=============================================================================
+            AUTHOR: JD Perry
+
+       DESCRIPTION: 
+
+    ==============================================================================*/  
+ 
+        v_cohort_term                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 9);
+        v_column10_1                  varchar2(3);
+        v_column10_2                  varchar2(3);
+        v_column10_3                  varchar2(3);
+        v_column10_4                  varchar2(3);
+        v_column45_1                  varchar2(3);
+        v_column45_2                  varchar2(3);
+        v_column45_3                  varchar2(3);
+        v_column45_4                  varchar2(3);
+        v_column29_1                  varchar2(3);
+        v_column29_2                  varchar2(3);
+        v_column29_3                  varchar2(3);
+        v_column29_4                  varchar2(3);
+
+        BEGIN
+
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_pell_recipient_counts';
+            
+            INSERT INTO sis_apps.ipeds_winter_pell_recipient_counts (line, column_10, column_45, column_29, cohort_term, reporting_term, date_added)
+                VALUES ('Full-time, first-time, degree/certificate-seeking cohort', 0, 0, 0, v_cohort_term, p_term, SYSDATE);  
+            
+            INSERT INTO sis_apps.ipeds_winter_pell_recipient_counts (line, column_10, column_45, column_29, cohort_term, reporting_term, date_added)
+                VALUES ('Recipients of a Pell Grant (within entering year)', 0, 0, 0, v_cohort_term, p_term, SYSDATE);  
+                
+            INSERT INTO sis_apps.ipeds_winter_pell_recipient_counts (line, column_10, column_45, column_29, cohort_term, reporting_term, date_added)
+                VALUES ('Recipients of a Direct Subsidized Loan that did not receive a Pell Grant', 0, 0, 0, v_cohort_term, p_term, SYSDATE);
+
+            INSERT INTO sis_apps.ipeds_winter_pell_recipient_counts (line, column_10, column_45, column_29, cohort_term, reporting_term, date_added)
+                VALUES ('Did not receive either a Pell Grant or Direct Subsidized Loan', 0, 0, 0, v_cohort_term, p_term, SYSDATE);
+                
+                
+        /*********************************************************************************************************
+                                           *****   ROW 1   *******
+        *********************************************************************************************************/
+            SELECT COUNT(*) INTO v_column10_1 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term;
+            
+            SELECT COUNT(*) INTO v_column45_1 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term 
+                   AND spbpers_dead_ind IS NOT NULL;
+            
+            SELECT COUNT(*) INTO v_column29_1 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term
+                   AND (rate = '100%' OR rate = '150%'); 
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+             SET column_10 = v_column10_1
+             WHERE line = 'Full-time, first-time, degree/certificate-seeking cohort';
+             
+             UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+             SET column_45 = v_column45_1
+             WHERE line = 'Full-time, first-time, degree/certificate-seeking cohort';
+             
+             UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+             SET column_29 = v_column29_1
+             WHERE line = 'Full-time, first-time, degree/certificate-seeking cohort';                     
+            
+
+        /*********************************************************************************************************
+                                          *****   ROW 2   *******
+        *********************************************************************************************************/
+            SELECT COUNT(*) INTO v_column10_2 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term 
+                   AND pell_ind IS NOT NULL;
+            
+            SELECT COUNT(*) INTO v_column45_2 
+            FROM ipeds_winter_grad_rates_details     
+               WHERE cohort_term = v_cohort_term 
+                   AND spbpers_dead_ind IS NOT NULL 
+                   AND pell_ind IS NOT NULL;
+            
+            SELECT COUNT(*) INTO v_column29_2 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term 
+                   AND (rate = '100%' OR rate = '150%') 
+                   AND pell_ind IS NOT NULL;  
+
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_10 = v_column10_2
+              WHERE line = 'Recipients of a Pell Grant (within entering year)';
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_45 = v_column45_2
+              WHERE line = 'Recipients of a Pell Grant (within entering year)';
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_29 = v_column29_2
+              WHERE line = 'Recipients of a Pell Grant (within entering year)';
+            
+            
+        /*********************************************************************************************************
+                                           *****   ROW 3   *******
+        *********************************************************************************************************/
+            SELECT COUNT(*) INTO v_column10_3 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term 
+                   AND pell_ind IS NULL
+                   AND dsub_ind IS NOT NULL;
+            
+            SELECT COUNT(*) INTO v_column45_3 
+            FROM ipeds_winter_grad_rates_details     
+               WHERE cohort_term = v_cohort_term 
+                   AND spbpers_dead_ind IS NOT NULL 
+                   AND pell_ind IS NULL
+                   AND dsub_ind IS NOT NULL;
+            
+            SELECT COUNT(*) INTO v_column29_3 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term 
+                   AND (rate = '100%' OR rate = '150%') 
+                   AND pell_ind IS NULL
+                   AND dsub_ind IS NOT NULL;  
+
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_10 = v_column10_3
+            WHERE line = 'Recipients of a Direct Subsidized Loan that did not receive a Pell Grant';
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_45 = v_column45_3
+            WHERE line = 'Recipients of a Direct Subsidized Loan that did not receive a Pell Grant';
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_29 = v_column29_3
+            WHERE line = 'Recipients of a Direct Subsidized Loan that did not receive a Pell Grant';
+            
+             
+                      
+        /*********************************************************************************************************
+                                           *****   ROW 4   *******
+        *********************************************************************************************************/
+            SELECT COUNT(*) INTO v_column10_4 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term 
+                   AND pell_ind IS NULL
+                   AND dsub_ind IS NULL;
+            
+            SELECT COUNT(*) INTO v_column45_4 
+            FROM ipeds_winter_grad_rates_details     
+               WHERE cohort_term = v_cohort_term 
+                   AND spbpers_dead_ind IS NOT NULL 
+                   AND pell_ind IS NULL
+                   AND dsub_ind IS NULL;
+            
+            SELECT COUNT(*) INTO v_column29_4 
+            FROM ipeds_winter_grad_rates_details 
+               WHERE cohort_term = v_cohort_term 
+                   AND (rate = '100%' OR rate = '150%') 
+                   AND pell_ind IS NULL
+                   AND dsub_ind IS NULL;  
+
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_10 = v_column10_3
+            WHERE line = 'Did not receive either a Pell Grant or Direct Subsidized Loan';
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_45 = v_column45_3
+            WHERE line = 'Did not receive either a Pell Grant or Direct Subsidized Loan';
+            
+            UPDATE sis_apps.ipeds_winter_pell_recipient_counts
+            SET column_29 = v_column29_3
+            WHERE line = 'Did not receive either a Pell Grant or Direct Subsidized Loan';
+                    
+            
+    END PZ_WINTER_PELL_RECIPIENTS;   
+           
+
+    PROCEDURE PZ_WINTER_OUTCOME_MEASURES (p_term IN varchar2) IS
+    /*=============================================================================
+            AUTHOR: Bob Barringer
+
+       DESCRIPTION: 
+
+    ==============================================================================*/  
+        v_student_uid              gen_apps.cams_ipeds_academic.student_uid%TYPE;       
+        v_student_id               gen_apps.cams_ipeds_academic.student_id%TYPE;       
+        v_student_pidm             gen_apps.cams_ipeds_academic.student_pidm%TYPE;       
+        v_spriden_id               gen_apps.cams_ipeds_academic.spriden_id%TYPE;         
+        v_cams_spriden_id          gen_apps.cams_ipeds_academic.cams_spriden_id%TYPE;         
+        v_student_ssn              gen_apps.cams_ipeds_academic.student_ssn%TYPE;
+        v_last_name                gen_apps.cams_ipeds_academic.last_name%TYPE; 
+        v_first_name               gen_apps.cams_ipeds_academic.first_name%TYPE; 
+        v_first_term               gen_apps.cams_ipeds_academic.first_term%TYPE;
+        v_term                     gen_apps.cams_ipeds_academic.term%TYPE;
+        v_adj_first_term           gen_apps.cams_ipeds_academic.term%TYPE; 
+        v_term_status              gen_apps.cams_ipeds_academic.term_status%TYPE; 
+        v_use_this_record          gen_apps.cams_ipeds_academic.use_this_record%TYPE; 
+        v_registered_credits       gen_apps.cams_ipeds_academic.registered_credits%TYPE;       
+        v_major_degree             gen_apps.cams_ipeds_academic.major_degree%TYPE; 
+        v_pell_award               gen_apps.cams_ipeds_academic.pell_award%TYPE;  
+        v_subln                    gen_apps.cams_ipeds_academic.subln%TYPE;  
+        v_transfer_credits_in      gen_apps.cams_ipeds_academic.transfer_credits_in%TYPE; 
+        v_spbpers_dead_ind         gen_apps.cams_ipeds_academic.spbpers_dead_ind%TYPE;
+        v_grad_term                gen_apps.cams_ipeds_demographic.grad_term%TYPE;        
+        v_shrdgmr_term_code_grad   shrdgmr.shrdgmr_term_code_grad%TYPE;
+        v_degree_type              varchar2(6);
+        v_graduated_term           varchar2(6);  
+        v_graduation_date          date;
+        v_conferred_date           date;  
+        v_aw_status                varchar2(10);
+        v_acyr                     varchar2(4); 
+        v_summer                   varchar2(6); 
+        v_fall                     varchar2(6);   
+        v_spring                   varchar2(6);   
+        v_summer_4                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 13);
+        v_summer_6                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 7);
+        v_summer_8                 varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 1);
+        v_cohort                   varchar2(14); 
+        v_debug_pidm               number(9);               
+
+        CURSOR cur_gather_data 
+        IS
+            WITH base AS ( -- show all people that will be used in Outcome Measures regardless of year
+                            SELECT DISTINCT
+                                   student_uid
+                                  ,student_id
+                                  ,student_pidm
+                                  ,spriden_id
+                                  ,cams_spriden_id
+                                  ,student_ssn
+                                  ,last_name
+                                  ,first_name
+                                  ,first_term                                  
+                                  ,term
+                                  ,term_status
+                                  ,registered_credits
+                                  ,major_degree
+                                  ,pell_award
+                                  ,subln
+                                  ,transfer_credits_in                                  
+                                  ,spbpers_dead_ind
+                                  ,use_this_record
+                            FROM gen_apps.cams_ipeds_academic 
+                            WHERE major_degree NOT IN ('Undecided', 'Transfer Module', 'Respiratory Track', 'Phlebotomy Track', 'Chiropractic Track', 'Undeclared - degree earned',
+                                                           'Undeclared - certificate earned',  'Nursing Track', 'PHC', 'PRP', 'TAG', 'TAH', 'TCD', 'TCE', 'TCR', 'TCT', 'TCJ', 'UNB', 'GEN')
+                            ORDER BY student_uid, term                                
+                            -- this query should return 1 record per person 
+                         ),         
+                 all_pseop_students AS ( -- find all people who have pseop records
+                                            SELECT student_uid
+                                                  ,term_status
+                                                  ,first_term
+                                                  ,term
+                                            FROM base b
+                                            WHERE EXISTS (  
+                                                            SELECT 1 
+                                                            FROM gen_apps.cams_ipeds_academic z
+                                                            WHERE b.student_uid = z.student_uid
+                                                                AND z.term_status = 'PSEOP'
+                                                         )  
+                                            ORDER BY student_uid, term                  
+                                       ),
+                 pseop AS ( -- show the first non-pseop record for each person
+                            SELECT d.student_uid
+                                  ,'New' AS term_status
+                                  ,d.first_term     
+                                  ,d.term  
+                                  ,d.term AS adj_first_term   -- need to include this field for the union later                                
+                            FROM base d JOIN ( -- get the first non-pseop record                            
+                                                SELECT p.student_uid, MIN(p.term) AS term
+                                                FROM all_pseop_students p LEFT OUTER JOIN ( -- get the last pseop record
+                                                                                            SELECT student_uid, MAX(term) AS term
+                                                                                            FROM all_pseop_students
+                                                                                            WHERE term_status = 'PSEOP'
+                                                                                            GROUP BY student_uid  
+                                                                                          ) q ON (p.student_uid = q.student_uid AND p.term > q.term)
+                                                WHERE p.term_status != 'PSEOP'
+                                                GROUP BY p.student_uid  
+                                             ) e ON (d.student_uid = e.student_uid AND d.term = e.term)
+                            WHERE d.term IN (v_summer, v_fall, v_spring) 
+                          ),                     
+                 number_records AS ( -- number each record in order of term, look at the 2nd term (next_term) for each person 
+                                        SELECT student_uid
+                                              ,term_status
+                                              ,first_term
+                                              ,term
+                                              ,LEAD(term) OVER (PARTITION BY student_uid ORDER BY term) next_term
+                                              ,ROW_NUMBER() OVER (PARTITION BY student_uid ORDER BY term) rn
+                                        FROM base b
+                                        WHERE use_this_record = 'YES'
+                                            AND NOT EXISTS (  
+                                                                SELECT 1 
+                                                                FROM pseop z
+                                                                WHERE b.student_uid = z.student_uid
+                                                           ) 
+                                   ),                 
+                 get_first_term AS ( -- if first_term = summer then change it to fall or spring if they have a next record, keep the original term_status
+                                        SELECT student_uid
+                                              ,term_status
+                                              ,first_term
+                                              ,term
+                                              ,CASE
+                                                  WHEN rn = 1 AND first_term = v_summer
+                                                  THEN 
+                                                    CASE
+                                                        WHEN next_term IN (v_fall, v_spring) 
+                                                        THEN next_term
+                                                        ELSE first_term
+                                                    END
+                                                  WHEN rn = 1 AND first_term IN (v_fall, v_spring) 
+                                                  THEN first_term
+                                              END AS adj_first_term
+                                        FROM number_records
+                                        WHERE rn = 1
+                                   ),
+                 union_pseop_gft AS ( -- combine the results from these two queries into a single dataset
+                                        SELECT student_uid, term_status, term AS first_term, term, adj_first_term FROM pseop
+                                        UNION
+                                        SELECT student_uid, term_status, first_term, term, adj_first_term FROM get_first_term                                        
+                                    )                          
+            SELECT upg.student_uid
+                  ,b.student_id
+                  ,b.student_pidm
+                  ,b.spriden_id
+                  ,b.cams_spriden_id
+                  ,b.student_ssn
+                  ,b.last_name
+                  ,b.first_name
+                  ,upg.first_term                                  
+                  ,upg.term
+                  ,upg.adj_first_term
+                  ,upg.term_status
+                  ,b.registered_credits
+                  ,b.major_degree
+                  ,b.pell_award
+                  ,b.subln
+                  ,b.transfer_credits_in                                  
+                  ,b.spbpers_dead_ind
+                  ,b.use_this_record    
+            FROM union_pseop_gft upg JOIN base b ON (upg.student_uid = b.student_uid AND upg.term = b.term)                      
+            WHERE upg.first_term IN (v_summer, v_fall, v_spring);      
+            
+            
+        CURSOR cur_award_status 
+        IS
+            WITH acad AS (
+                            SELECT student_pidm, first_term, term
+                            FROM gen_apps.cams_ipeds_academic 
+                            WHERE first_term IN (v_summer, v_fall, v_spring)
+                                AND use_this_record = 'YES'
+                         ),
+                 demog AS (
+                                SELECT student_pidm,
+                                       --SUBSTR(grad_degree, 1,1) AS grad_degree,
+                                       CASE 
+                                            WHEN grad_degree LIKE 'A%' THEN 'Assoc'
+                                            WHEN grad_degree LIKE 'C%' THEN 'Cert'
+                                            ELSE 'Unkn'
+                                       END AS grad_degree,
+                                       grad_term,
+                                       graduation_date,
+                                       conferred_date,
+                                       COALESCE(grad_term, sis_apps.utl_term.udf_get_curr_term_code_fwd(graduation_date), sis_apps.utl_term.udf_get_curr_term_code_fwd(conferred_date)) AS graduated_term
+                                FROM gen_apps.cams_ipeds_demographic a 
+                                WHERE (grad_degree NOT LIKE '%OHIO TRANSFER%' OR grad_degree IS NULL)
+                                    AND EXISTS (  
+                                                    SELECT 1 
+                                                    FROM acad z
+                                                    WHERE a.student_pidm = z.student_pidm
+                                               )           
+                          ),
+                 demog_rank AS (
+                                    SELECT d.*, ROW_NUMBER() OVER (PARTITION BY student_pidm, graduated_term ORDER BY SUBSTR(grad_degree, 1,1)) AS demog_degree_rk
+                                    FROM demog d
+                               ),
+                 demog_dedupe AS (
+                                    SELECT * FROM demog_rank WHERE demog_degree_rk = 1
+                                 ),
+                 banner AS (
+                                SELECT shrdgmr_pidm,
+                                       --SUBSTR(shrdgmr_degc_code, 1,1) AS dgmr_degree_type,
+                                       CASE 
+                                            WHEN shrdgmr_degc_code LIKE 'A%' THEN 'Assoc'
+                                            WHEN shrdgmr_degc_code LIKE 'C%' THEN 'Cert'
+                                            ELSE 'Unkn'
+                                       END AS dgmr_degree_type,
+                                       shrdgmr_term_code_grad,
+                                       ROW_NUMBER() OVER (PARTITION BY shrdgmr_pidm ORDER BY CASE WHEN shrdgmr_term_code_grad <= v_summer_4 THEN 1 WHEN shrdgmr_term_code_grad <= v_summer_6 THEN 2 WHEN shrdgmr_term_code_grad <= v_summer_8 THEN 3 ELSE NULL END, NVL(SUBSTR(shrdgmr_degc_code, 1,1), 'Z')) AS dgmr_degree_rk
+                                FROM shrdgmr
+                           ),
+                 banner_dedupe AS (
+                                    SELECT * FROM banner WHERE dgmr_degree_rk = 1
+                                  )
+            SELECT a.student_uid
+                  ,a.student_id
+                  ,a.student_pidm
+                  ,a.spriden_id
+                  ,a.last_name
+                  ,a.first_name   
+                  ,CASE WHEN d.graduated_term IS NULL THEN b.dgmr_degree_type ELSE d.grad_degree END AS degree_type   
+                  ,a.major_degree     
+                  ,a.pell_award
+                  ,a.first_term   
+                  ,d.grad_term
+                  ,d.graduation_date
+                  ,d.conferred_date
+                  ,b.shrdgmr_term_code_grad   
+                  ,COALESCE(d.graduated_term, b.shrdgmr_term_code_grad) AS graduated_term  -- look at grad_term from the demographic table first, take the shrdgmr_term_code_grad if it is null
+                  ,a.cohort    
+            FROM ipeds_winter_outcome_measures_details a 
+                LEFT OUTER JOIN demog_dedupe d ON (a.student_pidm = d.student_pidm)
+                LEFT OUTER JOIN banner_dedupe b ON (a.student_pidm = b.shrdgmr_pidm)    
+            WHERE a.acyr = v_acyr
+            ;        
+
+
+        CURSOR still_enrolled 
+        IS
+            WITH not_graduated AS ( 
+                                    SELECT student_pidm FROM ipeds_winter_outcome_measures_details WHERE reporting_term = p_term
+                                    MINUS 
+                                    SELECT student_pidm FROM ipeds_winter_award_status_details WHERE reporting_term = p_term
+                                  ),
+                 is_enrolled AS (
+                                    SELECT sfrstcr_pidm FROM sfrstcr WHERE sfrstcr_rsts_code LIKE 'R%' AND sfrstcr_term_code = p_term  
+                                ) 
+            SELECT student_uid
+                  ,student_id
+                  ,student_pidm
+                  ,spriden_id
+                  ,student_ssn
+                  ,last_name
+                  ,first_name
+                  ,adj_first_term
+                  ,term_status
+                  ,registered_credits
+                  ,major_degree
+                  ,pell_award
+                  ,transfer_credits_in
+                  ,spbpers_dead_ind
+                  ,cohort
+                  ,acyr
+            FROM ipeds_winter_outcome_measures_details
+            WHERE student_pidm IN (SELECT sfrstcr_pidm FROM is_enrolled)
+            ORDER BY student_pidm;
+        
+        
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+        BEGIN    
+            
+            v_debug_pidm := 79203;
+
+            SELECT TO_CHAR(TO_NUMBER(SUBSTR(p_term, 1, 4), '9999') - 7) INTO v_acyr FROM dual;
+
+            -- Terra moved to Banner in 2016, stvterm records prior to this are "Summer trailing", 2016 and beyond are "Summer leading"
+            IF v_acyr < '2016' THEN
+                SELECT sis_apps.utl_term.udf_get_term_code_bkwd(stvterm_code, 1) INTO v_summer FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_desc LIKE 'Fall%';
+                ELSE SELECT stvterm_code INTO v_summer FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_code NOT LIKE '9999%' AND stvterm_desc LIKE 'Summer%';
+            END IF;        
+            SELECT stvterm_code INTO v_fall FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_desc LIKE 'Fall%';    
+            SELECT stvterm_code INTO v_spring FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_desc LIKE 'Spring%'; 
+                    
+            
+            -- comment this line before production
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_outcome_measures_details';
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_award_status_details';  
+            EXECUTE IMMEDIATE 'truncate table sis_apps.ipeds_winter_om_still_enrolled_details'; 
+            
+            DBMS_OUTPUT.PUT_LINE('----  Outcome Measures  -----');  
+           
+            OPEN cur_gather_data;        
+                LOOP  
+                    v_student_uid := '';
+                    v_student_id := '';
+                    v_student_pidm := '';
+                    v_spriden_id := '';
+                    v_cams_spriden_id := '';
+                    v_student_ssn := '';
+                    v_last_name := '';
+                    v_first_name := '';
+                    v_first_term := '';                               
+                    v_term := '';
+                    v_adj_first_term := '';
+                    v_term_status := '';
+                    v_registered_credits := '';
+                    v_major_degree := '';
+                    v_pell_award := '';
+                    v_subln := '';
+                    v_transfer_credits_in := '';                                
+                    v_spbpers_dead_ind := '';
+                    v_use_this_record := '';
+                    v_cohort := '';
+                                    
+                    FETCH cur_gather_data
+                       INTO v_student_uid,
+                            v_student_id,
+                            v_student_pidm,
+                            v_spriden_id,
+                            v_cams_spriden_id,
+                            v_student_ssn,
+                            v_last_name,
+                            v_first_name,
+                            v_first_term,
+                            v_term,
+                            v_adj_first_term,
+                            v_term_status,
+                            v_registered_credits,
+                            v_major_degree,
+                            v_pell_award,
+                            v_subln,
+                            v_transfer_credits_in,
+                            v_spbpers_dead_ind,
+                            v_use_this_record;
+                    EXIT WHEN cur_gather_data%NOTFOUND;
+                    
+                    -- deciding which cohort to assign each record
+                    -- should undeclared degree type play a part in which cohort? don't think so                
+                    -- Terra did not have a transfer student type when they were using CAMS, so anyone with transfer credits will be NOT FIRST TIME
+                    -- not taking term_status into account here because continuing/readmit become FIRST TIME if it is their first term, new become NOT FIRST TIME if they have transfers
+                    -- deciding cohort only on transfer credits, pell, and registered credits
+                    CASE 
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status = 'New'
+                                AND v_transfer_credits_in = 'N' 
+                                    AND v_pell_award = 'Yes' 
+                                        AND v_registered_credits >= 12 THEN     
+                                            v_cohort := 'FTFT_PELL_YES';
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status = 'New'
+                                AND v_transfer_credits_in = 'N' 
+                                    AND v_pell_award = 'No' 
+                                        AND v_registered_credits >= 12 THEN     
+                                            v_cohort := 'FTFT_PELL_NO';
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status = 'New'
+                                AND v_transfer_credits_in = 'N' 
+                                    AND v_pell_award = 'Yes' 
+                                        AND v_registered_credits < 12 THEN     
+                                            v_cohort := 'FTPT_PELL_YES';
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status = 'New'
+                                AND v_transfer_credits_in = 'N'
+                                    AND v_pell_award = 'No' 
+                                        AND v_registered_credits < 12 THEN     
+                                            v_cohort := 'FTPT_PELL_NO';
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status IN ('ReAdmit', 'Continuing')
+                                --AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'Yes' 
+                                    AND v_registered_credits >= 12 THEN     
+                                        v_cohort := 'NFTFT_PELL_YES';  
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status IN ('ReAdmit', 'Continuing')
+                                --AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'No' 
+                                    AND v_registered_credits >= 12 THEN     
+                                        v_cohort := 'NFTFT_PELL_NO';                      
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status IN ('ReAdmit', 'Continuing')
+                                --AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'Yes' 
+                                    AND v_registered_credits < 12 THEN     
+                                        v_cohort := 'NFTPT_PELL_YES';  
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_term_status IN ('ReAdmit', 'Continuing')
+                                --AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'No' 
+                                    AND v_registered_credits < 12 THEN     
+                                        v_cohort := 'NFTPT_PELL_NO';                                      
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'Yes' 
+                                    AND v_registered_credits >= 12 THEN     
+                                        v_cohort := 'NFTFT_PELL_YES';                                 
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'No' 
+                                    AND v_registered_credits >= 12 THEN     
+                                        v_cohort := 'NFTFT_PELL_NO';   
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'Yes' 
+                                    AND v_registered_credits < 12 THEN     
+                                        v_cohort := 'NFTPT_PELL_YES';  
+                        WHEN v_first_term IN (v_summer, v_fall, v_spring)
+                            AND v_transfer_credits_in = 'Y'
+                                AND v_pell_award = 'No' 
+                                    AND v_registered_credits < 12 THEN     
+                                        v_cohort := 'NFTPT_PELL_NO';                                                                                      
+                        ELSE v_cohort := 'UNKNOWN';
+                             DBMS_OUTPUT.PUT_LINE('PIDM ' || v_student_pidm || ' WAS NOT COUNTED');  
+                             DBMS_OUTPUT.PUT_LINE('FIRST TERM ' || v_first_term); 
+                             DBMS_OUTPUT.PUT_LINE('TRANSFER CREDITS ' || v_transfer_credits_in); 
+                             DBMS_OUTPUT.PUT_LINE('PELL ' || v_pell_award); 
+                             DBMS_OUTPUT.PUT_LINE('REGISTERED CREDITS ' || v_registered_credits);                          
+                    END CASE;
+                            
+                    IF v_debug_pidm = v_student_pidm THEN     
+                             DBMS_OUTPUT.PUT_LINE('PIDM ' || v_student_pidm);  
+                             DBMS_OUTPUT.PUT_LINE('FIRST TERM ' || v_first_term); 
+                             DBMS_OUTPUT.PUT_LINE('TRANSFER CREDITS ' || v_transfer_credits_in); 
+                             DBMS_OUTPUT.PUT_LINE('PELL ' || v_pell_award); 
+                             DBMS_OUTPUT.PUT_LINE('REGISTERED CREDITS ' || v_registered_credits);
+                             DBMS_OUTPUT.PUT_LINE('COHORT ' || v_cohort);
+                    END IF;
+                    
+                    INSERT INTO sis_apps.ipeds_winter_outcome_measures_details 
+                        (student_uid, student_id, student_pidm, spriden_id, cams_spriden_id, student_ssn, last_name, first_name, first_term, term, adj_first_term, term_status, 
+                         registered_credits, major_degree, pell_award, subln, transfer_credits_in, spbpers_dead_ind, use_this_record, cohort, acyr, reporting_term, date_added)
+                    VALUES
+                        (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_cams_spriden_id, v_student_ssn, v_last_name, v_first_name, v_first_term, v_term, v_adj_first_term, v_term_status, 
+                         v_registered_credits, v_major_degree, v_pell_award, v_subln, v_transfer_credits_in, v_spbpers_dead_ind, v_use_this_record, TRIM(v_cohort), v_acyr, p_term, SYSDATE);
+                    COMMIT;            
+           
+                END LOOP;
+                                 
+            CLOSE cur_gather_data;
+        
+            DBMS_OUTPUT.PUT_LINE('--------------------------------------'); 
+
+            OPEN cur_award_status;        
+                LOOP  
+                    v_student_uid := '';
+                    v_student_id := '';
+                    v_student_pidm := '';
+                    v_spriden_id := '';
+                    v_last_name := '';
+                    v_first_name := '';
+                    v_degree_type := '';
+                    v_major_degree := '';
+                    v_pell_award := '';
+                    v_first_term := ''; 
+                    v_graduated_term := '';
+                    v_graduation_date := '';
+                    v_conferred_date := '';
+                    v_cohort := '';
+                    v_aw_status := '';
+                                                        
+                    FETCH cur_award_status
+                       INTO v_student_uid,
+                            v_student_id,
+                            v_student_pidm,
+                            v_spriden_id,
+                            v_last_name,
+                            v_first_name,
+                            v_degree_type,
+                            v_major_degree,
+                            v_pell_award,
+                            v_first_term,
+                            v_grad_term,
+                            v_graduation_date,
+                            v_conferred_date,
+                            v_shrdgmr_term_code_grad, 
+                            v_graduated_term,
+                            v_cohort;
+                    EXIT WHEN cur_award_status%NOTFOUND;
+
+                    
+                    CASE 
+                        WHEN v_graduated_term <= v_summer_4 THEN v_aw_status := '4 year';  
+                        WHEN v_graduated_term <= v_summer_6 THEN v_aw_status := '6 year';  
+                        WHEN v_graduated_term <= v_summer_8 THEN v_aw_status := '8 year';  
+                        ELSE v_aw_status := 'UNKNOWN';
+                    END CASE;
+                            
+                    IF v_aw_status = '4 year' THEN  
+                        INSERT INTO sis_apps.ipeds_winter_award_status_details 
+                            (student_uid, student_id, student_pidm, spriden_id, last_name, first_name, degree_type, major_degree, pell_award, first_term, grad_term, graduation_date, 
+                             conferred_date, shrdgmr_term_code_grad, graduated_term, cohort, aw_status, acyr, reporting_term, date_added)
+                        VALUES
+                            (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_last_name, v_first_name, v_degree_type, v_major_degree, v_pell_award, v_first_term, v_grad_term, v_graduation_date, 
+                             v_conferred_date, v_shrdgmr_term_code_grad, v_graduated_term, v_cohort, v_aw_status, v_acyr, p_term, SYSDATE);
+                        COMMIT; 
+                         
+                        v_aw_status := '6 year';
+                        INSERT INTO sis_apps.ipeds_winter_award_status_details 
+                            (student_uid, student_id, student_pidm, spriden_id, last_name, first_name, degree_type, major_degree, pell_award, first_term, grad_term, graduation_date, 
+                             conferred_date, shrdgmr_term_code_grad, graduated_term, cohort, aw_status, acyr, reporting_term, date_added)
+                        VALUES
+                            (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_last_name, v_first_name, v_degree_type, v_major_degree, v_pell_award, v_first_term, v_grad_term, v_graduation_date, 
+                             v_conferred_date, v_shrdgmr_term_code_grad, v_graduated_term, v_cohort, v_aw_status, v_acyr, p_term, SYSDATE);
+                        COMMIT;
+                      
+                        v_aw_status := '8 year';
+                        INSERT INTO sis_apps.ipeds_winter_award_status_details 
+                            (student_uid, student_id, student_pidm, spriden_id, last_name, first_name, degree_type, major_degree, pell_award, first_term, grad_term, graduation_date, 
+                             conferred_date, shrdgmr_term_code_grad, graduated_term, cohort, aw_status, acyr, reporting_term, date_added)
+                        VALUES
+                            (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_last_name, v_first_name, v_degree_type, v_major_degree, v_pell_award, v_first_term, v_grad_term, v_graduation_date, 
+                             v_conferred_date, v_shrdgmr_term_code_grad, v_graduated_term, v_cohort, v_aw_status, v_acyr, p_term, SYSDATE);
+                        COMMIT;                       
+                    
+                    ELSIF v_aw_status = '6 year' THEN
+                        INSERT INTO sis_apps.ipeds_winter_award_status_details 
+                            (student_uid, student_id, student_pidm, spriden_id, last_name, first_name, degree_type, major_degree, pell_award, first_term, grad_term, graduation_date, 
+                             conferred_date, shrdgmr_term_code_grad, graduated_term, cohort, aw_status, acyr, reporting_term, date_added)
+                        VALUES
+                            (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_last_name, v_first_name, v_degree_type, v_major_degree, v_pell_award, v_first_term, v_grad_term, v_graduation_date, 
+                             v_conferred_date, v_shrdgmr_term_code_grad, v_graduated_term, v_cohort, v_aw_status, v_acyr, p_term, SYSDATE);
+                        COMMIT;
+                      
+                        v_aw_status := '8 year';
+                        INSERT INTO sis_apps.ipeds_winter_award_status_details 
+                            (student_uid, student_id, student_pidm, spriden_id, last_name, first_name, degree_type, major_degree, pell_award, first_term, grad_term, graduation_date, 
+                             conferred_date, shrdgmr_term_code_grad, graduated_term, cohort, aw_status, acyr, reporting_term, date_added)
+                        VALUES
+                            (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_last_name, v_first_name, v_degree_type, v_major_degree, v_pell_award, v_first_term, v_grad_term, v_graduation_date, 
+                             v_conferred_date, v_shrdgmr_term_code_grad, v_graduated_term, v_cohort, v_aw_status, v_acyr, p_term, SYSDATE);
+                        COMMIT;
+                        
+                    ELSIF v_aw_status = '8 year' THEN
+                        INSERT INTO sis_apps.ipeds_winter_award_status_details 
+                            (student_uid, student_id, student_pidm, spriden_id, last_name, first_name, degree_type, major_degree, pell_award, first_term, grad_term, graduation_date, 
+                             conferred_date, shrdgmr_term_code_grad, graduated_term, cohort, aw_status, acyr, reporting_term, date_added)
+                        VALUES
+                            (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_last_name, v_first_name, v_degree_type, v_major_degree, v_pell_award, v_first_term, v_grad_term, v_graduation_date, 
+                             v_conferred_date, v_shrdgmr_term_code_grad, v_graduated_term, v_cohort, v_aw_status, v_acyr, p_term, SYSDATE);
+                        COMMIT;                         
+                    END IF;
+                END LOOP;
+            CLOSE cur_award_status;
+
+            OPEN still_enrolled;        
+                LOOP  
+                    v_student_uid := '';
+                    v_student_id := '';
+                    v_student_pidm := '';
+                    v_spriden_id := '';
+                    v_student_ssn := '';
+                    v_last_name := '';
+                    v_first_name := '';
+                    v_adj_first_term := '';
+                    v_term_status := '';
+                    v_registered_credits := '';
+                    v_major_degree := '';
+                    v_pell_award := '';
+                    v_transfer_credits_in := '';
+                    v_spbpers_dead_ind := '';
+                    v_cohort := '';
+                                                        
+                    FETCH still_enrolled
+                       INTO v_student_uid,
+                            v_student_id,
+                            v_student_pidm,
+                            v_spriden_id,
+                            v_student_ssn,
+                            v_last_name,
+                            v_first_name,
+                            v_adj_first_term,
+                            v_term_status,
+                            v_registered_credits,
+                            v_major_degree,
+                            v_pell_award,
+                            v_transfer_credits_in,
+                            v_spbpers_dead_ind, 
+                            v_cohort,
+                            v_acyr;
+                    EXIT WHEN still_enrolled%NOTFOUND;
+                                               
+                    INSERT INTO sis_apps.ipeds_winter_om_still_enrolled_details 
+                        (student_uid, student_id, student_pidm, spriden_id, student_ssn, last_name, first_name, adj_first_term, term_status, registered_credits, major_degree, pell_award, 
+                         transfer_credits_in, spbpers_dead_ind, cohort, acyr, reporting_term, date_added)
+                    VALUES
+                        (v_student_uid, v_student_id, v_student_pidm, v_spriden_id, v_student_ssn, v_last_name, v_first_name, v_adj_first_term, v_term_status, v_registered_credits, v_major_degree, v_pell_award, 
+                         v_transfer_credits_in, v_spbpers_dead_ind, v_cohort, v_acyr, p_term, SYSDATE);
+                    COMMIT; 
+                         
+                END LOOP;
+            CLOSE still_enrolled;  
+-- cohort, acyr, reporting_term, date_added)                        
+--  v_acyr, p_term, SYSDATE);
+
+
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+
+    END PZ_WINTER_OUTCOME_MEASURES;
+    
+     
+    
+END ETL_IPEDS_WINTER_COLLECTION;
