@@ -1,4 +1,4 @@
-create or replace PACKAGE BODY                            ETL_IPEDS_WINTER_COLLECTION AS
+create or replace PACKAGE BODY                                              ETL_IPEDS_WINTER_COLLECTION AS
 /******************************************************************************
    NAME:       IPEDS_WINTER_COLLECTION 
    PURPOSE:    Create IPEDS Winter Collection file.
@@ -8,6 +8,7 @@ create or replace PACKAGE BODY                            ETL_IPEDS_WINTER_COLLE
    Ver        Date        Author           Description
    ---------  ----------  ---------------  ------------------------------------
    1.0        02/07/2022  rbarrin3         1. Created package
+   1.1        01/30/2024  jperry7          2. Remapped some packages to pull data from the IPEDS spring tables moving forward
                                                        
 ******************************************************************************/
 
@@ -271,8 +272,8 @@ create or replace PACKAGE BODY                            ETL_IPEDS_WINTER_COLLE
         
         CURSOR cur_grad_200 IS  
             WITH main_query AS (
-                                    SELECT b.spbpers_pidm
-                                          ,a.tnumber AS spriden_id
+                                   SELECT b.spbpers_pidm
+                                          ,a.SPRIDEN_ID AS spriden_id
                                           ,b.spbpers_ssn                                          
                                           ,d.shrdgmr_term_code_grad
                                           ,NVL(a.spbpers_sex, 'N') AS spbpers_sex  -- pulling in spbpers_sex here because we are using a table that predates ipeds_sex
@@ -289,13 +290,13 @@ create or replace PACKAGE BODY                            ETL_IPEDS_WINTER_COLLE
                                           ,e.rpratrm_fund_code AS pell_ind
                                           ,f.rpratrm_fund_code AS dsub_ind
                                           ,g.rpratrm_fund_code AS dunsub_ind
-                                    FROM ipeds_201740_deg_cohorts a                                         
-                                        JOIN spbpers b ON (a.pidm = b.spbpers_pidm)                                        
-                                        LEFT OUTER JOIN shrdgmr d ON (a.pidm = d.shrdgmr_pidm)
-                                        LEFT OUTER JOIN rpratrm e ON (a.pidm = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
-                                        LEFT OUTER JOIN rpratrm f ON (a.pidm = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
-                                        LEFT OUTER JOIN rpratrm g ON (a.pidm = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period = v_cohort_term)
-                                    WHERE a.time_status = 'FT'                              
+                                    FROM sis_apps.ipeds_spring_coll_details a                                         
+                                        JOIN spbpers b ON (a.SPRIDEN_PIDM = b.spbpers_pidm)                                        
+                                        LEFT OUTER JOIN shrdgmr d ON (a.SPRIDEN_PIDM = d.shrdgmr_pidm)
+                                        LEFT OUTER JOIN rpratrm e ON (a.SPRIDEN_PIDM = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm f ON (a.SPRIDEN_PIDM = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm g ON (a.SPRIDEN_PIDM = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period = v_cohort_term)
+                                    WHERE a.COHORT like 'FULL TIME%'                                
                                ),
                  ranking AS (      
                                 SELECT z.*, ROW_NUMBER() OVER (PARTITION BY spbpers_pidm ORDER BY awlevel) AS degree_rk  
@@ -400,8 +401,8 @@ Sherri looked at their profiles and said to count them this way. This will need 
 
                 END LOOP;  
                 
-                UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_201740_deg_cohorts WHERE time_status = 'FT') WHERE line LIKE '1.%' AND cohort_term = v_cohort_term;
-                UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_201740_deg_cohorts WHERE time_status = 'FT' AND spbpers_dead_ind IS NOT NULL) WHERE line LIKE '6.%' AND cohort_term = v_cohort_term;
+               -- UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_201740_deg_cohorts WHERE time_status = 'FT') WHERE line LIKE '1.%' AND cohort_term = v_cohort_term;
+               -- UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_201740_deg_cohorts WHERE time_status = 'FT' AND spbpers_dead_ind IS NOT NULL) WHERE line LIKE '6.%' AND cohort_term = v_cohort_term;
                 UPDATE sis_apps.ipeds_winter_200_counts SET count_1 = (SELECT COUNT(*) FROM ipeds_winter_200_details WHERE cohort_term = v_cohort_term) WHERE line LIKE '8.%' AND cohort_term = v_cohort_term;
                 COMMIT;
                               
@@ -487,7 +488,7 @@ Sherri looked at their profiles and said to count them this way. This will need 
         CURSOR cur_still_enrolled_200 IS     
             WITH main_query AS (
                                     SELECT b.spbpers_pidm
-                                          ,a.tnumber AS spriden_id
+                                          ,a.spriden_id AS spriden_id
                                           ,b.spbpers_ssn
                                           ,d.sgbstdn_term_code_eff
                                           ,NVL(a.spbpers_sex, 'N') AS spbpers_sex   -- pulling in spbpers_sex here because we are using a table that predates ipeds_sex
@@ -508,13 +509,13 @@ Sherri looked at their profiles and said to count them this way. This will need 
                                           ,e.rpratrm_fund_code AS pell_ind
                                           ,f.rpratrm_fund_code AS dsub_ind
                                           ,g.rpratrm_fund_code AS dunsub_ind
-                                    FROM ipeds_201740_deg_cohorts a                                         
-                                        JOIN spbpers b ON (a.pidm = b.spbpers_pidm)
-                                        LEFT OUTER JOIN sgbstdn d ON (a.pidm = d.sgbstdn_pidm AND v_cohort_term = d.sgbstdn_term_code_eff)
-                                        LEFT OUTER JOIN rpratrm e ON (a.pidm = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
-                                        LEFT OUTER JOIN rpratrm f ON (a.pidm = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
-                                        LEFT OUTER JOIN rpratrm g ON (a.pidm = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period =  v_cohort_term)
-                                    WHERE a.time_status = 'FT'
+                                    FROM ipeds_spring_coll_details a                                         
+                                        JOIN spbpers b ON (a.spriden_pidm = b.spbpers_pidm)
+                                        LEFT OUTER JOIN sgbstdn d ON (a.spriden_pidm = d.sgbstdn_pidm AND v_cohort_term = d.sgbstdn_term_code_eff)
+                                        LEFT OUTER JOIN rpratrm e ON (a.spriden_pidm = e.rpratrm_pidm AND e.rpratrm_fund_code = 'PELL' AND e.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm f ON (a.spriden_pidm = f.rpratrm_pidm AND f.rpratrm_fund_code = 'DSUB' AND f.rpratrm_period = v_cohort_term)
+                                        LEFT OUTER JOIN rpratrm g ON (a.spriden_pidm = g.rpratrm_pidm AND g.rpratrm_fund_code = 'DUNSUB' AND g.rpratrm_period =  v_cohort_term)
+                                    WHERE a.cohort Like 'FULL TIME%'
                                         AND NOT EXISTS (   -- this filters out people who did graduate with 200%
                                                             SELECT 1 
                                                             FROM ipeds_winter_200_details z
@@ -1586,15 +1587,12 @@ Sherri looked at their profiles and said to count them this way. This will need 
 
         BEGIN    
             
-            v_debug_pidm := 79203;
+          --  v_debug_pidm := 79203;
 
             SELECT TO_CHAR(TO_NUMBER(SUBSTR(p_term, 1, 4), '9999') - 7) INTO v_acyr FROM dual;
 
             -- Terra moved to Banner in 2016, stvterm records prior to this are "Summer trailing", 2016 and beyond are "Summer leading"
-            IF v_acyr < '2016' THEN
-                SELECT sis_apps.utl_term.udf_get_term_code_bkwd(stvterm_code, 1) INTO v_summer FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_desc LIKE 'Fall%';
-                ELSE SELECT stvterm_code INTO v_summer FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_code NOT LIKE '9999%' AND stvterm_desc LIKE 'Summer%';
-            END IF;        
+                 
             SELECT stvterm_code INTO v_fall FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_desc LIKE 'Fall%';    
             SELECT stvterm_code INTO v_spring FROM stvterm WHERE stvterm_acyr_code = v_acyr AND stvterm_desc LIKE 'Spring%'; 
                     
