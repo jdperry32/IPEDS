@@ -1,0 +1,2642 @@
+create or replace PACKAGE BODY          ETL_IPEDS_SPRING_COLLECTION AS
+/******************************************************************************
+   NAME:       IPEDS_SPRING_COLLECTION
+   PURPOSE:
+
+   REVISIONS:
+   Ver        Date        Author           Description
+   ---------  ----------  ---------------  ------------------------------------
+   1.0        7/2/2020      rbarrin3       1. Created this package body.
+   2.0        3/17/2021     rbarrin3       1. Changed this package a lot to fit the numbers submitted for 201940
+   2.1        4/22/2021     rbarrin3       1. Removed truncate statements and added reporting_term & date_added fields to each table so that we keep the data each year
+                                           2. Added ALL_DL & SOME_DL fields to the IPEDS_SPRING_COLL_DETAILS table to indicate distance learning students 
+******************************************************************************/
+
+-- PART A
+    PROCEDURE GetDataSet (p_term IN varchar2) 
+    IS
+        v_spriden_pidm                spriden.spriden_pidm%TYPE; 
+        v_spriden_id                  spriden.spriden_id%TYPE; 
+        v_sfrstcr_term_code           sfrstcr.sfrstcr_term_code%TYPE;  
+        v_spbpers_sex                 spbpers.spbpers_sex%TYPE;   
+        v_ipeds_sex                   spbpers.spbpers_sex%TYPE;   
+        v_spbpers_ethn_cde            spbpers.spbpers_ethn_cde%TYPE;   
+        v_gorprac_race_cde            gorprac.gorprac_race_cde%TYPE;   
+        v_gorvisa_vtyp_code           gorvisa.gorvisa_vtyp_code%TYPE;   
+        v_sfrstcr_rsts_code           sfrstcr.sfrstcr_rsts_code%TYPE; 
+        v_sgbstdn_term_code_eff       sgbstdn.sgbstdn_term_code_eff%TYPE; 
+        v_sgbstdn_styp_code           sgbstdn.sgbstdn_styp_code%TYPE; 
+        v_sgbstdn_degc_code           sgbstdn.sgbstdn_degc_code_1%TYPE;   
+        v_spraddr_from_date           spraddr.spraddr_from_date%TYPE;
+        v_sfrthst_tmst_code           sfrthst.sfrthst_tmst_code%TYPE; 
+        v_sgbstdn_resd_code           sgbstdn.sgbstdn_resd_code%TYPE; 
+        v_spraddr_stat_code           spraddr.spraddr_stat_code%TYPE;
+        v_spraddr_natn_code           spraddr.spraddr_natn_code%TYPE; 
+        v_spbpers_dead_ind            spbpers.spbpers_dead_ind%TYPE;
+        v_full_part                   varchar2(7);  -- used in the ethnicity totals
+        v_race_code                   varchar2(1);
+        v_age                         number;  
+        v_cohort                      varchar2(100);
+        v_summer                      varchar2(6) := sis_apps.utl_term.udf_get_term_code_bkwd (p_term, 1);
+      
+        CURSOR cur_gather_data 
+        IS
+            WITH time_status AS ( -- get the most recent time status for each student
+                                 SELECT a.sfrthst_pidm
+                                       ,a.sfrthst_tmst_code
+                                       ,a.sfrthst_term_code
+                                       ,b.sfrthst_tmst_date
+                                 FROM sfrthst a JOIN (
+                                                      SELECT sfrthst_pidm
+                                                            ,MAX(sfrthst_tmst_date) AS sfrthst_tmst_date
+                                                      FROM sfrthst 
+                                                      WHERE sfrthst_term_code = p_term
+                                                      GROUP BY sfrthst_pidm
+                                                     ) b ON (a.sfrthst_pidm = b.sfrthst_pidm AND a.sfrthst_tmst_date = b.sfrthst_tmst_date)
+                                 WHERE sfrthst_tmst_code IN ('FT', 'HT', '3Q', 'LH')
+                                ),   
+                 base_table AS ( -- get the most recent sgbstdn record for each student up to p_term
+                                SELECT DISTINCT
+                                       a.sgbstdn_pidm 
+                                      ,a.sgbstdn_styp_code 
+                                      ,a.sgbstdn_term_code_eff 
+                                      ,a.sgbstdn_resd_code
+                                      ,CASE -- looking at sgbstdn_degc_code_1 first and then at sgbstdn_degc_code_2 & taking the first cert or assoc value to show up
+                                          WHEN a.sgbstdn_degc_code_1 NOT LIKE 'C%' AND a.sgbstdn_degc_code_1 NOT LIKE 'A%' THEN
+                                             CASE 
+                                               WHEN a.sgbstdn_degc_code_2 LIKE 'C%' OR a.sgbstdn_degc_code_2 LIKE 'A%' THEN sgbstdn_degc_code_2 
+                                               ELSE a.sgbstdn_degc_code_1 
+                                             END
+                                          WHEN a.sgbstdn_styp_code IN ('G', 'H') THEN 'ND'   
+                                          ELSE a.sgbstdn_degc_code_1 
+                                       END AS sgbstdn_degc_code
+                                      ,b.sfrstcr_term_code 
+                                FROM sgbstdn a JOIN ( -- need all students who registered for classes
+                                                     SELECT DISTINCT sfrstcr_pidm, sfrstcr_term_code
+                                                     FROM sfrstcr
+                                                     WHERE sfrstcr_rsts_code LIKE 'R%'
+                                                    ) b ON (a.sgbstdn_pidm = b.sfrstcr_pidm AND a.sgbstdn_term_code_eff <= b.sfrstcr_term_code)  
+                                               JOIN (    
+                                                     SELECT sgbstdn_pidm, MAX(sgbstdn_term_code_eff) AS sgbstdn_term_code_eff 
+                                                     FROM sgbstdn
+                                                     WHERE sgbstdn_term_code_eff <= v_summer
+                                                     GROUP BY sgbstdn_pidm
+                                                    ) c ON (a.sgbstdn_pidm = c.sgbstdn_pidm AND a.sgbstdn_term_code_eff = c.sgbstdn_term_code_eff)
+                                WHERE a.sgbstdn_styp_code IN ('T', 'N', 'C', 'G', 'H', 'R') -- do not need S, Z, or 0 codes
+                                    AND b.sfrstcr_term_code = v_summer
+                                UNION    
+                                SELECT DISTINCT
+                                       a.sgbstdn_pidm 
+                                      ,a.sgbstdn_styp_code 
+                                      ,a.sgbstdn_term_code_eff 
+                                      ,a.sgbstdn_resd_code
+                                      ,CASE -- looking at sgbstdn_degc_code_1 first and then at sgbstdn_degc_code_2 & taking the first cert or assoc value to show up
+                                          WHEN a.sgbstdn_degc_code_1 NOT LIKE 'C%' AND a.sgbstdn_degc_code_1 NOT LIKE 'A%' THEN
+                                             CASE 
+                                               WHEN a.sgbstdn_degc_code_2 LIKE 'C%' OR a.sgbstdn_degc_code_2 LIKE 'A%' THEN sgbstdn_degc_code_2 
+                                               ELSE a.sgbstdn_degc_code_1 
+                                             END
+                                          WHEN a.sgbstdn_styp_code IN ('G', 'H') THEN 'ND'   
+                                          ELSE a.sgbstdn_degc_code_1 
+                                       END AS sgbstdn_degc_code
+                                      ,b.sfrstcr_term_code 
+                                FROM sgbstdn a JOIN ( -- need all students who registered for classes
+                                                     SELECT DISTINCT sfrstcr_pidm, sfrstcr_term_code
+                                                     FROM sfrstcr
+                                                     WHERE sfrstcr_rsts_code LIKE 'R%'
+                                                    ) b ON (a.sgbstdn_pidm = b.sfrstcr_pidm AND a.sgbstdn_term_code_eff <= b.sfrstcr_term_code)  
+                                               JOIN (    
+                                                     SELECT sgbstdn_pidm, MAX(sgbstdn_term_code_eff) AS sgbstdn_term_code_eff 
+                                                     FROM sgbstdn
+                                                     WHERE sgbstdn_term_code_eff <= p_term               
+                                                     GROUP BY sgbstdn_pidm
+                                                    ) c ON (a.sgbstdn_pidm = c.sgbstdn_pidm AND a.sgbstdn_term_code_eff = c.sgbstdn_term_code_eff)
+                                WHERE a.sgbstdn_styp_code IN ('T', 'N', 'C', 'G', 'H', 'R') -- do not need S, Z, or 0 codes
+                                    AND b.sfrstcr_term_code = p_term
+                                ),                           
+                 summer_term AS ( -- find everyone that has summer before p_term as their first registered record
+                                 SELECT ts.sfrthst_pidm
+                                       ,ts.sfrthst_tmst_date
+                                       ,ts.sfrthst_term_code
+                                       ,ts.sfrthst_tmst_code 
+                                       ,y.sfrstcr_term_code
+                                       ,y.sgbstdn_resd_code
+                                       ,y.sgbstdn_term_code_eff
+                                       ,y.sgbstdn_styp_code
+                                       ,y.sgbstdn_degc_code
+                                 FROM time_status ts JOIN base_table y ON (ts.sfrthst_pidm = y.sgbstdn_pidm) 
+                                 WHERE 1=1
+                                    AND y.sgbstdn_styp_code = 'N'
+                                    AND y.sfrstcr_term_code = v_summer
+                                ),
+                 fall_term AS ( -- find everyone that has a p_term record
+                               SELECT ts.sfrthst_pidm
+                                     ,ts.sfrthst_tmst_date
+                                     ,ts.sfrthst_term_code
+                                     ,ts.sfrthst_tmst_code
+                                     ,y.sfrstcr_term_code
+                                     ,y.sgbstdn_resd_code
+                                     ,y.sgbstdn_term_code_eff
+                                     ,y.sgbstdn_styp_code
+                                     ,y.sgbstdn_degc_code
+                               FROM time_status ts JOIN base_table y ON (ts.sfrthst_pidm = y.sgbstdn_pidm)                                       
+                               WHERE y.sfrstcr_term_code = p_term
+                              ),
+                 join_summer_fall AS ( -- find everyone that has summer as the first term and fall as the second
+                                      SELECT sfrthst_pidm
+                                            ,sfrthst_tmst_date
+                                            ,sfrthst_tmst_code
+                                            ,sfrstcr_term_code
+                                            ,sgbstdn_resd_code
+                                            ,sgbstdn_term_code_eff
+                                            ,sgbstdn_styp_code
+                                            ,sgbstdn_degc_code
+                                            ,ROW_NUMBER() OVER (PARTITION BY sfrthst_pidm ORDER BY sfrthst_term_code) AS term_rk -- some people will have records for multiple terms, this takes the earliest out of v_summer & v_fall
+                                      FROM (
+                                            SELECT b.sfrthst_pidm
+                                                  ,b.sfrthst_tmst_date
+                                                  ,b.sfrthst_term_code
+                                                  ,b.sfrthst_tmst_code
+                                                  ,COALESCE (a.sfrstcr_term_code, b.sfrstcr_term_code) AS sfrstcr_term_code
+                                                  ,b.sgbstdn_resd_code
+                                                  ,b.sgbstdn_term_code_eff
+                                                  ,COALESCE (a.sgbstdn_styp_code, b.sgbstdn_styp_code) AS sgbstdn_styp_code
+                                                  ,b.sgbstdn_degc_code
+                                                  ,ROW_NUMBER() OVER (PARTITION BY b.sfrthst_pidm ORDER BY b.sfrthst_term_code) AS term_rk 
+                                            FROM summer_term a RIGHT OUTER JOIN fall_term b ON (a.sfrthst_pidm = b.sfrthst_pidm)
+                                            )
+                                     ),
+                 address_type AS (
+                                  SELECT 'PR' AS spraddr_atyp_code, 1 AS indx FROM dual
+                                  UNION
+                                  SELECT 'LO', 2 FROM dual
+                                  UNION
+                                  SELECT 'BI', 3 FROM dual
+                                 ),                    
+                 registered_students AS (
+                                         SELECT DISTINCT
+                                                e.spriden_pidm
+                                               ,e.spriden_id
+                                               ,a.sfrstcr_term_code
+											   ,NVL(b.spbpers_sex, 'N') AS spbpers_sex
+                                               ,baninst1.f_calculate_age(SYSDATE, b.spbpers_birth_date, NULL) AS age
+                                               ,CASE b.spbpers_ethn_cde WHEN '2' THEN 'H' ELSE spbpers_ethn_cde END AS spbpers_ethn_cde
+                                               ,CASE  ----- likely remove these antiquated race fields
+                                                    WHEN e.spriden_pidm IN (
+                                                                            SELECT gorprac_pidm 
+                                                                            FROM (SELECT gorprac_pidm, COUNT(*) FROM gorprac GROUP BY gorprac_pidm HAVING COUNT(*) > 1)
+                                                                           ) THEN 'M' 
+                                                    WHEN d.gorprac_race_cde IS NULL THEN 'U' 
+                                                    ELSE d.gorprac_race_cde
+                                                END AS gorprac_race_cde
+                                               ,c.gorvisa_vtyp_code
+                                               ,sis_apps.utl_ipeds.f_ipeds_get_race_code(spriden_pidm) AS race_code 
+                                               ,a.sfrstcr_rsts_code
+                                               ,f.spraddr_stat_code 
+                                               ,f.spraddr_natn_code
+                                               ,f.spraddr_from_date
+                                               ,b.spbpers_dead_ind
+                                               ,ROW_NUMBER() OVER (PARTITION BY a.sfrstcr_pidm, a.sfrstcr_term_code ORDER BY e.rowid) race_rk -- needed so that multicial people are not counted multiple times
+                                         FROM sfrstcr a 
+                                             JOIN spbpers b ON (a.sfrstcr_pidm = b.spbpers_pidm)
+                                             LEFT OUTER JOIN gorvisa c ON (a.sfrstcr_pidm = c.gorvisa_pidm)
+                                             LEFT OUTER JOIN gorprac d ON (a.sfrstcr_pidm = d.gorprac_pidm) 
+                                             LEFT OUTER JOIN spriden e ON (a.sfrstcr_pidm = e.spriden_pidm)   
+                                             LEFT OUTER JOIN spraddr f ON (a.sfrstcr_pidm = f.spraddr_pidm)
+                                             JOIN address_type g ON (f.spraddr_atyp_code = g.spraddr_atyp_code)
+                                         WHERE e.spriden_change_ind IS NULL 
+                                             AND a.sfrstcr_rsts_code LIKE 'R%'
+                                         ORDER BY e.spriden_pidm     
+                                        )
+            SELECT DISTINCT
+                   rs.spriden_pidm
+                  ,rs.spriden_id
+                  ,rs.sfrstcr_term_code
+                  ,rs.spbpers_sex
+                  ,rs.spbpers_sex AS ipeds_sex
+                  ,rs.age
+                  ,rs.spbpers_ethn_cde 
+                  ,rs.gorprac_race_cde
+                  ,rs.gorvisa_vtyp_code
+                  ,rs.race_code
+                  ,rs.sfrstcr_rsts_code
+                  ,jsf.sgbstdn_resd_code
+                  ,jsf.sfrthst_tmst_code
+                  ,jsf.sgbstdn_term_code_eff
+                  ,jsf.sgbstdn_styp_code
+                  ,jsf.sgbstdn_degc_code
+                  ,rs.spraddr_stat_code 
+                  ,rs.spraddr_natn_code 
+                  ,rs.spraddr_from_date
+                  --,'No' AS distance_learning
+                  ,rs.spbpers_dead_ind
+            FROM join_summer_fall jsf JOIN registered_students rs ON (jsf.sfrthst_pidm = rs.spriden_pidm AND jsf.sfrstcr_term_code = rs.sfrstcr_term_code)
+            WHERE 1=1
+                AND race_rk = 1
+                AND term_rk = 1
+                --AND jsf.sgbstdn_degc_code != '000000'  -- undeclared major
+            ORDER BY spriden_pidm, sfrstcr_term_code  
+            ;
+            -- this query should return 1 record per person 
+        
+        CURSOR cur_ethnicity_totals 
+        IS
+            SELECT spriden_pidm, 
+                   ipeds_sex, 
+                   CASE 
+                        WHEN cohort LIKE 'FULL%' THEN 'FULL' 
+                        WHEN cohort LIKE 'PART%' THEN 'PART' 
+                        ELSE 'UNKNOWN' 
+                   END AS "FULL/PART",
+                   CASE 
+                        WHEN gorvisa_vtyp_code IS NOT NULL THEN 'N'
+                        WHEN spbpers_ethn_cde = 'H' THEN 'H'
+                        ELSE gorprac_race_cde
+                   END AS ethnicity    
+            FROM ipeds_spring_coll_details
+            WHERE reporting_term = p_term;
+        
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+    BEGIN    
+                                   
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('FULL TIME, FIRST TIME, DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('FULL TIME, TRANSFER, DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('FULL TIME, CONTINUING, DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('FULL TIME, NON-DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE);  
+        
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('PART TIME, FIRST TIME, DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('PART TIME, TRANSFER, DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE);   
+        
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('PART TIME, CONTINUING, DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE);  
+        
+        INSERT INTO sis_apps.ipeds_spring_ethnicity_counts 
+        VALUES ('PART TIME, NON-DEGREE SEEKING', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, p_term, SYSDATE); 
+        
+        COMMIT;
+        
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('NONRESIDENT ALIEN', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('HISPANIC/LATINO', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('AMERICAN INDIAN OR ALASKA NATIVE', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('ASIAN', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('BLACK OR AFRICAN AMERICAN', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('WHITE', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('TWO OR MORE RACES', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('RACE AND ETHNICITY UNKNOWN', 'M', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('NONRESIDENT ALIEN', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('HISPANIC/LATINO', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('AMERICAN INDIAN OR ALASKA NATIVE', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('ASIAN', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('BLACK OR AFRICAN AMERICAN', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('WHITE', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('TWO OR MORE RACES', 'F', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('RACE AND ETHNICITY UNKNOWN', 'F', 0, 0, 0, p_term, SYSDATE);         
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('NONRESIDENT ALIEN', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('HISPANIC/LATINO', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('AMERICAN INDIAN OR ALASKA NATIVE', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('ASIAN', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('BLACK OR AFRICAN AMERICAN', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('WHITE', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('TWO OR MORE RACES', 'N', 0, 0, 0, p_term, SYSDATE); 
+        INSERT INTO sis_apps.ipeds_spring_ethn_totals VALUES ('RACE AND ETHNICITY UNKNOWN', 'N', 0, 0, 0, p_term, SYSDATE); 
+        COMMIT;
+        
+        OPEN cur_gather_data; 
+       
+            LOOP 
+                v_spriden_pidm := '';
+                v_spriden_id := '';
+                v_sfrstcr_term_code := '';        
+                v_spbpers_sex := ''; 
+                v_ipeds_sex := ''; 
+                v_age := ''; 
+                v_spbpers_ethn_cde := ''; 
+                v_gorprac_race_cde := '';
+                v_gorvisa_vtyp_code := '';  
+                v_race_code := '';
+                v_sfrstcr_rsts_code := ''; 
+                v_sgbstdn_resd_code := ''; 
+                v_sgbstdn_term_code_eff := '';
+                v_sgbstdn_styp_code := '';
+                v_sgbstdn_degc_code := '';
+                v_sfrthst_tmst_code := '';
+                v_spraddr_stat_code := '';
+                v_spraddr_natn_code := '';
+                v_spraddr_from_date := '';
+                v_spbpers_dead_ind := '';
+                v_cohort := '';
+              
+                FETCH cur_gather_data
+                   INTO v_spriden_pidm,
+                        v_spriden_id,
+                        v_sfrstcr_term_code,        
+                        v_spbpers_sex,
+                        v_ipeds_sex,
+                        v_age,     
+                        v_spbpers_ethn_cde, 
+                        v_gorprac_race_cde,
+                        v_gorvisa_vtyp_code,  
+                        v_race_code,
+                        v_sfrstcr_rsts_code, 
+                        v_sgbstdn_resd_code,
+                        v_sfrthst_tmst_code, 
+                        v_sgbstdn_term_code_eff,
+                        v_sgbstdn_styp_code,
+                        v_sgbstdn_degc_code,
+                        v_spraddr_stat_code,
+                        v_spraddr_natn_code,
+                        v_spraddr_from_date,
+                        v_spbpers_dead_ind;
+                EXIT WHEN cur_gather_data%NOTFOUND;      
+                         
+
+
+---- unknown genders ----
+                IF v_spbpers_sex = 'N' THEN  ----- ask Sherri or Terra how to count these people
+                        DBMS_OUTPUT.PUT_LINE('PIDM ' || v_spriden_pidm || ' / ' || v_spriden_id || ' has an unknown gender'); 
+                END IF; 
+                    
+/*
+IPEDS does not have a way to count people with unknown genders. We had 5 for 202040 Fall Enrollment. 
+Sherri looked at their profiles and said to count them this way. This will need to be done each year. 
+*/                 
+                CASE 
+                    WHEN v_spriden_id IN ('T00214190', 'T00062576') THEN v_ipeds_sex := 'F';
+                    WHEN v_spriden_id IN ('T00211484', 'T00201747', 'T00214028') THEN v_ipeds_sex := 'M';
+                    ELSE NULL;
+                END CASE;
+------------------------                
+                
+                -- deciding which cohort to assign each record
+                CASE 
+                    WHEN v_sfrthst_tmst_code = 'FT'  
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_sgbstdn_styp_code = 'N' THEN     
+                                v_cohort := 'FULL TIME, FIRST TIME, DEGREE SEEKING';
+                    WHEN v_sfrthst_tmst_code = 'FT'  
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_sgbstdn_styp_code = 'T' THEN     
+                                v_cohort := 'FULL TIME, TRANSFER, DEGREE SEEKING'; 
+                    WHEN v_sfrthst_tmst_code = 'FT'  
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_sgbstdn_styp_code IN ('R', 'C') THEN     
+                                v_cohort := 'FULL TIME, CONTINUING, DEGREE SEEKING'; 
+                    WHEN v_sfrthst_tmst_code = 'FT'  
+                        AND v_sgbstdn_degc_code = 'ND' THEN     
+                            v_cohort := 'FULL TIME, NON-DEGREE SEEKING'; 
+                    WHEN v_sfrthst_tmst_code != 'FT'  
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_sgbstdn_styp_code = 'N' THEN     
+                                v_cohort := 'PART TIME, FIRST TIME, DEGREE SEEKING';
+                    WHEN v_sfrthst_tmst_code != 'FT'  
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_sgbstdn_styp_code = 'T' THEN     
+                                v_cohort := 'PART TIME, TRANSFER, DEGREE SEEKING'; 
+                    WHEN v_sfrthst_tmst_code != 'FT'  
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_sgbstdn_styp_code IN ('R', 'C') THEN     
+                                v_cohort := 'PART TIME, CONTINUING, DEGREE SEEKING'; 
+                    WHEN v_sfrthst_tmst_code != 'FT'  
+                        AND v_sgbstdn_degc_code = 'ND' THEN     
+                            v_cohort := 'PART TIME, NON-DEGREE SEEKING';                                            
+                    ELSE v_cohort := 'UNKNOWN';
+                END CASE;
+
+                v_cohort := TRIM(v_cohort);                  
+                
+                -- all other procedures will use this table
+                INSERT INTO sis_apps.ipeds_spring_coll_details
+                    (spriden_pidm, spriden_id, sfrstcr_term_code, spbpers_sex, ipeds_sex, age, spbpers_ethn_cde, gorprac_race_cde, gorvisa_vtyp_code, 
+                     race_code, spraddr_stat_code, spraddr_natn_code, spraddr_from_date, all_dl, some_dl, spbpers_dead_ind, sfrstcr_rsts_code, sgbstdn_resd_code, 
+                     sfrthst_tmst_code, sgbstdn_term_code_eff, sgbstdn_styp_code, sgbstdn_degc_code, cohort, reporting_term, date_added)
+                VALUES
+                    (v_spriden_pidm, v_spriden_id, v_sfrstcr_term_code, v_spbpers_sex, v_ipeds_sex, v_age, v_spbpers_ethn_cde, v_gorprac_race_cde, v_gorvisa_vtyp_code, 
+                     v_race_code, v_spraddr_stat_code, v_spraddr_natn_code, v_spraddr_from_date, 'No', 'No', v_spbpers_dead_ind, v_sfrstcr_rsts_code, v_sgbstdn_resd_code, 
+                     v_sfrthst_tmst_code, v_sgbstdn_term_code_eff, v_sgbstdn_styp_code, v_sgbstdn_degc_code, v_cohort, p_term, SYSDATE);
+                COMMIT;            
+     
+                IF v_ipeds_sex = 'M' THEN
+                    IF v_race_code = 'N' THEN
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET nonres_m = nonres_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'H' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET hisp_m = hisp_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'I' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET nativ_m = nativ_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'O' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET asian_m = asian_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'B' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET afr_m = afr_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'P' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET pacif_m = pacif_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'C' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET cauc_m = cauc_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'M' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET multi_m = multi_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'U' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET unkn_m = unkn_m + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    END IF;
+                ELSIF v_ipeds_sex = 'F' THEN
+                    IF v_race_code = 'N' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET nonres_f = nonres_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'H' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET hisp_f = hisp_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'I' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET nativ_f = nativ_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'O' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET asian_f = asian_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'B' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET afr_f = afr_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'P' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET pacif_f = pacif_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'C' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET cauc_f = cauc_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'M' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET multi_f = multi_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'U' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET unkn_f = unkn_f + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    END IF;
+                ELSIF v_ipeds_sex = 'N' THEN
+                    IF v_race_code = 'N' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET nonres_n = nonres_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'H' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET hisp_n = hisp_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'I' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET nativ_n = nativ_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'O' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET asian_n = asian_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'B' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET afr_n = afr_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'P' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET pacif_n = pacif_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'C' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET cauc_n = cauc_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'M' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET multi_n = multi_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term;
+                    ELSIF v_race_code = 'U' THEN 
+                        UPDATE sis_apps.ipeds_spring_ethnicity_counts SET unkn_n = unkn_n + 1 WHERE cohort = v_cohort AND reporting_term = p_term; 
+                    END IF;
+                ELSE DBMS_OUTPUT.PUT_LINE('ETHNICITY COUNTS: PIDM ' || v_spriden_pidm || ' WAS NOT COUNTED');     
+                END IF;  
+                    
+            END LOOP;                 
+   
+        CLOSE cur_gather_data;
+                
+        OPEN cur_ethnicity_totals;
+               
+            LOOP                                                                         
+                v_spriden_pidm := '';                                                                                                       
+                v_ipeds_sex := '';                                                                                              
+                v_full_part := '';                                                         
+                v_race_code := ''; 
+                                                                                       
+                FETCH cur_ethnicity_totals
+                   INTO v_spriden_pidm,
+                        v_ipeds_sex,
+                        v_full_part,
+                        v_race_code;
+                EXIT WHEN cur_ethnicity_totals%NOTFOUND;  
+
+               
+                IF v_full_part = 'FULL' THEN 
+                    IF v_race_code = 'N' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity = 'NONRESIDENT ALIEN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'H' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity = 'HISPANIC/LATINO' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'I' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity LIKE 'AMERICAN INDIAN%' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'O' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity = 'ASIAN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'B' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity = 'BLACK OR AFRICAN AMERICAN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'P' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity LIKE 'NATIVE HAWAIIAN%' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'C' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity = 'WHITE' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'M' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity = 'TWO OR MORE RACES' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'U' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_full_time = total_full_time + 1 
+                        WHERE race_ethnicity = 'RACE AND ETHNICITY UNKNOWN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    END IF; 
+                ELSIF v_full_part = 'PART' THEN 
+                    IF v_race_code = 'N' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity = 'NONRESIDENT ALIEN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'H' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity = 'HISPANIC/LATINO' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'I' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity LIKE 'AMERICAN INDIAN%' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'O' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity = 'ASIAN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'B' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity = 'BLACK OR AFRICAN AMERICAN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'P' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity LIKE 'NATIVE HAWAIIAN%' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'C' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity = 'WHITE' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term; 
+                    ELSIF v_race_code = 'M' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity = 'TWO OR MORE RACES' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSIF v_race_code = 'U' THEN 
+                        UPDATE ipeds_spring_ethn_totals 
+                        SET total_part_time = total_part_time + 1 
+                        WHERE race_ethnicity = 'RACE AND ETHNICITY UNKNOWN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                    ELSE DBMS_OUTPUT.PUT_LINE('ETHNICITY TOTAL NOT COUNTED FOR PIDM ' || v_spriden_pidm);  
+                    END IF; 
+                END IF;             
+               
+                COMMIT;
+                
+                IF v_race_code = 'N' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity = 'NONRESIDENT ALIEN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSIF v_race_code = 'H' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity = 'HISPANIC/LATINO' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSIF v_race_code = 'I' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity LIKE 'AMERICAN INDIAN%' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSIF v_race_code = 'O' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity = 'ASIAN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSIF v_race_code = 'B' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity = 'BLACK OR AFRICAN AMERICAN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSIF v_race_code = 'P' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity LIKE 'NATIVE HAWAIIAN%' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSIF v_race_code = 'C' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity = 'WHITE' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term; 
+                ELSIF v_race_code = 'M' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1
+                    WHERE race_ethnicity = 'TWO OR MORE RACES' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSIF v_race_code = 'U' THEN 
+                    UPDATE ipeds_spring_ethn_totals 
+                    SET grand_total = grand_total + 1 
+                    WHERE race_ethnicity = 'RACE AND ETHNICITY UNKNOWN' AND ipeds_sex = v_ipeds_sex AND reporting_term = p_term;
+                ELSE DBMS_OUTPUT.PUT_LINE('ETHNICITY GRAND_TOTAL NOT COUNTED FOR PIDM ' || v_spriden_pidm);  
+                END IF; 
+            
+            COMMIT;
+
+            END LOOP;
+                        
+        CLOSE cur_ethnicity_totals; 
+        
+        
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+        
+    END GetDataSet;
+    
+
+-- PART A_DL    
+    PROCEDURE GetDataSet_DL (p_term IN varchar2) 
+    IS
+        v_spriden_id                  spriden.spriden_id%TYPE; 
+        v_sgbstdn_degc_code           sgbstdn.sgbstdn_degc_code_1%TYPE;   
+        v_spraddr_stat_code           spraddr.spraddr_stat_code%TYPE;
+        v_spraddr_natn_code           spraddr.spraddr_natn_code%TYPE; 
+        v_distance                    varchar2(21);     
+        v_count_sections              number;
+        v_count_classes               number;
+      
+      
+        CURSOR cur_distance_learning_1 
+        IS
+            WITH sections AS (
+                              SELECT z.spriden_pidm
+                                    ,z.spriden_id
+                                    ,z.sfrstcr_term_code
+                                    ,z.sgbstdn_degc_code
+                                    ,z.spraddr_stat_code
+                                    ,z.spraddr_natn_code 
+                                    ,CASE 
+                                         WHEN x.ssbsect_seq_numb BETWEEN 901 AND 950 THEN 'DISTANCE LEARNING'
+                                         ELSE 'NOT DISTANCE LEARNING'
+                                     END AS distance
+                              FROM ipeds_spring_coll_details z 
+                                JOIN sfrstcr y ON (z.spriden_pidm = y.sfrstcr_pidm AND z.sfrstcr_term_code = y.sfrstcr_term_code)
+                                JOIN ssbsect x ON (y.sfrstcr_crn = x.ssbsect_crn AND y.sfrstcr_term_code = x.ssbsect_term_code)
+                              WHERE z.sfrstcr_rsts_code LIKE 'R%'
+                                  AND z.reporting_term = p_term
+                             ), 
+                 distance_sections AS (
+                                       SELECT spriden_pidm
+                                             ,spriden_id
+                                             ,sfrstcr_term_code
+                                             ,sgbstdn_degc_code
+                                             ,spraddr_stat_code
+                                             ,spraddr_natn_code
+                                             ,distance
+                                             ,COUNT(*) AS count_sections
+                                       FROM sections
+                                       GROUP BY spriden_pidm, spriden_id, sfrstcr_term_code, sgbstdn_degc_code, spraddr_stat_code, spraddr_natn_code, distance
+                                      ),            
+                 classes AS (
+                             SELECT z.spriden_pidm
+                                   ,z.spriden_id
+                                   ,z.sfrstcr_term_code
+                                   ,COUNT(*) AS count_classes 
+                             FROM ipeds_spring_coll_details z 
+                                JOIN sfrstcr y ON (z.spriden_pidm = y.sfrstcr_pidm AND z.sfrstcr_term_code = y.sfrstcr_term_code)
+                                JOIN ssbsect x ON (y.sfrstcr_crn = x.ssbsect_crn AND y.sfrstcr_term_code = x.ssbsect_term_code)
+                             WHERE z.sfrstcr_rsts_code LIKE 'R%'
+                                AND z.reporting_term = p_term
+                             GROUP BY z.spriden_pidm, z.spriden_id, z.sfrstcr_term_code
+                             )
+            SELECT w.spriden_id, w.sgbstdn_degc_code, w.distance, w.count_sections, v.count_classes      
+            FROM distance_sections w JOIN classes v ON (w.spriden_id = v.spriden_id AND w.sfrstcr_term_code = v.sfrstcr_term_code);
+
+
+        CURSOR cur_distance_learning_2
+        IS 
+            WITH sections AS (
+                              SELECT z.spriden_pidm
+                                    ,z.spriden_id
+                                    ,z.sfrstcr_term_code
+                                    ,z.sgbstdn_degc_code
+                                    ,z.spraddr_stat_code
+                                    ,z.spraddr_natn_code 
+                                    ,CASE 
+                                         WHEN x.ssbsect_seq_numb BETWEEN 901 AND 950 THEN 'DISTANCE LEARNING'
+                                         ELSE 'NOT DISTANCE LEARNING'
+                                     END AS distance
+                              FROM ipeds_spring_coll_details z 
+                                JOIN sfrstcr y ON (z.spriden_pidm = y.sfrstcr_pidm AND z.sfrstcr_term_code = y.sfrstcr_term_code)
+                                JOIN ssbsect x ON (y.sfrstcr_crn = x.ssbsect_crn AND y.sfrstcr_term_code = x.ssbsect_term_code)
+                              WHERE z.sfrstcr_rsts_code LIKE 'R%'
+                                AND z.reporting_term = p_term
+                             ), 
+                 distance_sections AS (
+                                       SELECT spriden_pidm
+                                             ,spriden_id
+                                             ,sfrstcr_term_code
+                                             ,sgbstdn_degc_code
+                                             ,spraddr_stat_code
+                                             ,spraddr_natn_code
+                                             ,distance
+                                             ,COUNT(*) AS count_sections
+                                       FROM sections
+                                       GROUP BY spriden_pidm, spriden_id, sfrstcr_term_code, sgbstdn_degc_code, spraddr_stat_code, spraddr_natn_code, distance
+                                      ),            
+                 classes AS (
+                             SELECT z.spriden_pidm
+                                   ,z.spriden_id
+                                   ,z.sfrstcr_term_code
+                                   ,COUNT(*) AS count_classes 
+                             FROM ipeds_spring_coll_details z JOIN sfrstcr y ON (z.spriden_pidm = y.sfrstcr_pidm AND z.sfrstcr_term_code = y.sfrstcr_term_code)
+                                JOIN ssbsect x ON (y.sfrstcr_crn = x.ssbsect_crn AND y.sfrstcr_term_code = x.ssbsect_term_code)
+                             WHERE z.sfrstcr_rsts_code LIKE 'R%'
+                                AND z.reporting_term = p_term
+                             GROUP BY z.spriden_pidm, z.spriden_id, z.sfrstcr_term_code
+                            )
+            SELECT w.spriden_id, w.sgbstdn_degc_code, w.spraddr_stat_code, w.spraddr_natn_code      
+            FROM distance_sections w JOIN classes v ON (w.spriden_id = v.spriden_id AND w.sfrstcr_term_code = v.sfrstcr_term_code)
+            WHERE w.count_sections = v.count_classes
+                AND w.distance = 'DISTANCE LEARNING';
+                
+
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+    BEGIN    
+                
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Enrolled exclusively in distance education courses', 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Enrolled in some but not all distance education courses', 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Not enrolled in any distance education courses', 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Located in OH', 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Located in the U.S. but not in OH', 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Located in the U.S. but state/jurisdiction unknown', 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Located outside the U.S.', 0, 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_distance_learning 
+        VALUES ('Location unknown/unreported', 0, 0, p_term, SYSDATE); 
+        
+        COMMIT;
+
+   
+        OPEN cur_distance_learning_1; 
+       
+            LOOP                                                                         
+                v_spriden_id := '';                                                                                                       
+                v_sgbstdn_degc_code := '';                                                                                              
+                v_distance := '';                                                         
+                v_count_sections := ''; 
+                v_count_classes := ''; 
+                                                                                       
+                FETCH cur_distance_learning_1
+                   INTO v_spriden_id,
+                        v_sgbstdn_degc_code,
+                        v_distance,
+                        v_count_sections,
+                        v_count_classes;
+                EXIT WHEN cur_distance_learning_1%NOTFOUND;               
+                
+                CASE
+                    WHEN v_distance = 'DISTANCE LEARNING'
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_count_sections = v_count_classes THEN
+                                UPDATE ipeds_spring_distance_learning 
+                                SET degree_seeking = degree_seeking + 1 
+                                WHERE cohort = 'Enrolled exclusively in distance education courses' AND reporting_term = p_term;
+                                
+                                UPDATE ipeds_spring_coll_details 
+                                SET all_dl = 'Yes' 
+                                WHERE spriden_id = v_spriden_id AND reporting_term = p_term;
+                                
+                    WHEN v_distance = 'NOT DISTANCE LEARNING'
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_count_sections = v_count_classes THEN
+                                UPDATE ipeds_spring_distance_learning 
+                                SET degree_seeking = degree_seeking + 1 
+                                WHERE cohort = 'Not enrolled in any distance education courses' AND reporting_term = p_term;
+                                                                
+                    WHEN v_distance = 'NOT DISTANCE LEARNING'
+                        AND v_sgbstdn_degc_code != 'ND' 
+                            AND v_count_sections != v_count_classes THEN
+                                UPDATE ipeds_spring_distance_learning 
+                                SET degree_seeking = degree_seeking + 1 
+                                WHERE cohort = 'Enrolled in some but not all distance education courses' AND reporting_term = p_term;
+                                
+                                UPDATE ipeds_spring_coll_details 
+                                SET some_dl = 'Yes' 
+                                WHERE spriden_id = v_spriden_id AND reporting_term = p_term;
+                                                                                                
+                    WHEN v_distance = 'DISTANCE LEARNING'
+                        AND v_sgbstdn_degc_code = 'ND' 
+                            AND v_count_sections = v_count_classes THEN
+                                UPDATE ipeds_spring_distance_learning 
+                                SET non_degree_seeking = non_degree_seeking + 1 
+                                WHERE cohort = 'Enrolled exclusively in distance education courses' AND reporting_term = p_term;
+                                
+                                UPDATE ipeds_spring_coll_details 
+                                SET all_dl = 'Yes' 
+                                WHERE spriden_id = v_spriden_id AND reporting_term = p_term;
+                                                                
+                    WHEN v_distance = 'NOT DISTANCE LEARNING'
+                        AND v_sgbstdn_degc_code = 'ND' 
+                            AND v_count_sections = v_count_classes THEN
+                                UPDATE ipeds_spring_distance_learning 
+                                SET non_degree_seeking = non_degree_seeking + 1 
+                                WHERE cohort = 'Not enrolled in any distance education courses' AND reporting_term = p_term;
+                                                                      
+                    WHEN v_distance = 'NOT DISTANCE LEARNING'
+                        AND v_sgbstdn_degc_code = 'ND' 
+                            AND v_count_sections != v_count_classes THEN
+                                UPDATE ipeds_spring_distance_learning 
+                                SET non_degree_seeking = non_degree_seeking + 1 
+                                WHERE cohort = 'Enrolled in some but not all distance education courses' AND reporting_term = p_term; 
+                                
+                                UPDATE ipeds_spring_coll_details 
+                                SET some_dl = 'Yes' 
+                                WHERE spriden_id = v_spriden_id AND reporting_term = p_term;
+                                                                      
+                    ELSE NULL; 
+                END CASE;
+                COMMIT;       
+
+            END LOOP;      
+                        
+        CLOSE cur_distance_learning_1;
+        
+        
+        OPEN cur_distance_learning_2; 
+       
+            LOOP                                                                         
+                v_spriden_id := '';                                                       
+                v_sgbstdn_degc_code := '';                                                
+                v_spraddr_stat_code := '';                                                
+                v_spraddr_natn_code := '';                                                
+                                                                                       
+                FETCH cur_distance_learning_2   
+                   INTO v_spriden_id,
+                        v_sgbstdn_degc_code, 
+                        v_spraddr_stat_code,
+                        v_spraddr_natn_code;
+                EXIT WHEN cur_distance_learning_2%NOTFOUND;               
+                
+               
+                CASE
+                    WHEN v_sgbstdn_degc_code != 'ND'
+                        AND v_spraddr_stat_code = 'OH' THEN 
+                            UPDATE ipeds_spring_distance_learning 
+                            SET degree_seeking = degree_seeking + 1 
+                            WHERE cohort = 'Located in OH' AND reporting_term = p_term;   
+                                      
+                    WHEN v_sgbstdn_degc_code != 'ND'
+                        AND v_spraddr_stat_code != 'OH' THEN
+                            UPDATE ipeds_spring_distance_learning 
+                            SET degree_seeking = degree_seeking + 1 
+                            WHERE cohort = 'Located in the U.S. but not in OH' AND reporting_term = p_term;    
+                                    
+                    WHEN v_sgbstdn_degc_code != 'ND'
+                        AND v_spraddr_natn_code = 'US' 
+                            AND v_spraddr_stat_code IS NULL THEN 
+                                UPDATE ipeds_spring_distance_learning 
+                                SET degree_seeking = degree_seeking + 1 
+                                WHERE cohort = 'Located in the U.S. but state/jurisdiction unknown' AND reporting_term = p_term;       
+                                               
+                    WHEN v_sgbstdn_degc_code != 'ND'
+                        AND v_spraddr_natn_code != 'US' THEN 
+                            UPDATE ipeds_spring_distance_learning 
+                            SET degree_seeking = degree_seeking + 1 
+                            WHERE cohort = 'Located outside the U.S.' AND reporting_term = p_term;      
+                            
+                    WHEN v_sgbstdn_degc_code != 'ND'  
+                        AND v_spraddr_natn_code IS NULL
+                            AND v_spraddr_stat_code IS NULL THEN 
+                                UPDATE ipeds_spring_distance_learning 
+                                SET degree_seeking = degree_seeking + 1 
+                                WHERE cohort = 'Location unknown/unreported' AND reporting_term = p_term;       
+                                         
+                    WHEN v_sgbstdn_degc_code = 'ND'
+                        AND v_spraddr_stat_code = 'OH' THEN 
+                            UPDATE ipeds_spring_distance_learning 
+                            SET non_degree_seeking = non_degree_seeking + 1 
+                            WHERE cohort = 'Located in OH' AND reporting_term = p_term;   
+                                
+                    WHEN v_sgbstdn_degc_code = 'ND'
+                        AND v_spraddr_stat_code != 'OH' THEN
+                            UPDATE ipeds_spring_distance_learning 
+                            SET non_degree_seeking = non_degree_seeking + 1 
+                            WHERE cohort = 'Located in the U.S. but not in OH' AND reporting_term = p_term;     
+                                    
+                    WHEN v_sgbstdn_degc_code = 'ND'
+                        AND v_spraddr_natn_code = 'US' 
+                            AND v_spraddr_stat_code IS NULL THEN 
+                                UPDATE ipeds_spring_distance_learning 
+                                SET non_degree_seeking = non_degree_seeking + 1 
+                                WHERE cohort = 'Located in the U.S. but state/jurisdiction unknown' AND reporting_term = p_term;   
+                                                    
+                    WHEN v_sgbstdn_degc_code = 'ND'
+                        AND v_spraddr_natn_code != 'US' THEN                            
+                            UPDATE ipeds_spring_distance_learning 
+                            SET non_degree_seeking = non_degree_seeking + 1 
+                            WHERE cohort = 'Located outside the U.S.' AND reporting_term = p_term;       
+                               
+                    WHEN v_sgbstdn_degc_code = 'ND'  
+                        AND v_spraddr_natn_code IS NULL
+                            AND v_spraddr_stat_code IS NULL THEN 
+                                UPDATE ipeds_spring_distance_learning 
+                                SET non_degree_seeking = non_degree_seeking + 1 
+                                WHERE cohort = 'Location unknown/unreported' AND reporting_term = p_term;                       
+                    ELSE NULL;
+                END CASE; 
+                COMMIT;
+
+
+            END LOOP;
+            
+                        
+        CLOSE cur_distance_learning_2;        
+     
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+
+    END GetDataSet_DL;
+
+
+
+-- PART B
+    PROCEDURE AggregateAge (p_term IN varchar2) 
+    IS
+        v_spriden_id                  spriden.spriden_id%TYPE; 
+        v_ipeds_sex                   spbpers.spbpers_sex%TYPE;   
+        v_sfrthst_tmst_code           sfrthst.sfrthst_tmst_code%TYPE; 
+        v_age                         number;  
+
+      
+        CURSOR cur_get_age 
+        IS
+            SELECT spriden_id
+                  ,sfrthst_tmst_code
+                  ,ipeds_sex
+                  ,age 
+            FROM ipeds_spring_coll_details
+            WHERE reporting_term = p_term;
+
+
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+    BEGIN    
+               
+        INSERT INTO ipeds_spring_age_counts 
+        VALUES ('FULL TIME', 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_age_counts 
+        VALUES ('PART TIME', 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, p_term, SYSDATE); 
+        COMMIT;
+        
+        
+        OPEN cur_get_age; 
+
+            LOOP 
+                v_spriden_id := '';  
+                v_sfrthst_tmst_code := '';  
+                v_ipeds_sex := ''; 
+                v_age := ''; 
+
+                FETCH cur_get_age
+                   INTO v_spriden_id,
+                        v_sfrthst_tmst_code,
+                        v_ipeds_sex,
+                        v_age; 
+                EXIT WHEN cur_get_age%NOTFOUND;               
+                
+                
+                    IF v_age <= 17 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_under_18 = m_under_18 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_under_18 = f_under_18 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_under_18 = n_under_18 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_under_18 = m_under_18 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_under_18 = f_under_18 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_under_18 = n_under_18 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;
+                        END IF;
+                    ELSIF v_age BETWEEN 18 AND 19 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_18_19 = m_18_19 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_18_19 = f_18_19 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_18_19 = n_18_19 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_18_19 = m_18_19 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_18_19 = f_18_19 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_18_19 = n_18_19 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;
+                    ELSIF v_age BETWEEN 20 AND 21 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_20_21 = m_20_21 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_20_21 = f_20_21 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_20_21 = n_20_21 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_20_21 = m_20_21 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_20_21 = f_20_21 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_20_21 = n_20_21 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;   
+                    ELSIF v_age BETWEEN 22 AND 24 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_22_24 = m_22_24 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_22_24 = f_22_24 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_22_24 = n_22_24 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_22_24 = m_22_24 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_22_24 = f_22_24 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_22_24 = n_22_24 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;
+                    ELSIF v_age BETWEEN 25 AND 29 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_25_29 = m_25_29 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_25_29 = f_25_29 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_25_29 = n_25_29 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_25_29 = m_25_29 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_25_29 = f_25_29 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_25_29 = n_25_29 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;    
+                    ELSIF v_age BETWEEN 30 AND 34 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_30_34 = m_30_34 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_30_34 = f_30_34 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_30_34 = n_30_34 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_30_34 = m_30_34 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_30_34 = f_30_34 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_30_34 = n_30_34 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;     
+                    ELSIF v_age BETWEEN 35 AND 39 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_35_39 = m_35_39 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_35_39 = f_35_39 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_35_39 = n_35_39 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_35_39 = m_35_39 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_35_39 = f_35_39 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_35_39 = n_35_39 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;  
+                    ELSIF v_age BETWEEN 40 AND 49 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_40_49 = m_40_49 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_40_49 = f_40_49 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_40_49 = n_40_49 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_40_49 = m_40_49 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_40_49 = f_40_49 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_40_49 = n_40_49 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;     
+                    ELSIF v_age BETWEEN 50 AND 64 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_50_64 = m_50_64 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_50_64 = f_50_64 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_50_64 = n_50_64 + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_50_64 = m_50_64 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_50_64 = f_50_64 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_50_64 = n_50_64 + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;     
+                    ELSIF v_age >= 65 THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_65_and_over = m_65_and_over + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_65_and_over = f_65_and_over + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_65_and_over = n_65_and_over + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_65_and_over = m_65_and_over + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_65_and_over = f_65_and_over + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_65_and_over = n_65_and_over + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF; 
+                    ELSIF v_age IS NULL THEN
+                        IF v_sfrthst_tmst_code = 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_unknown = m_unknown + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_unknown = f_unknown + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_unknown = n_unknown + 1 WHERE time_status = 'FULL TIME' AND reporting_term = p_term;
+                            END IF;
+                        ELSIF  v_sfrthst_tmst_code != 'FT' THEN
+                            IF v_ipeds_sex = 'M' THEN 
+                                UPDATE ipeds_spring_age_counts SET m_unknown = m_unknown + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSIF v_ipeds_sex = 'F' THEN 
+                                UPDATE ipeds_spring_age_counts SET f_unknown = f_unknown + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            ELSE UPDATE ipeds_spring_age_counts SET n_unknown = n_unknown + 1 WHERE time_status = 'PART TIME' AND reporting_term = p_term;
+                            END IF;    
+                        END IF;         
+                    END IF;
+                
+                COMMIT;            
+            
+           END LOOP;
+            
+                        
+        CLOSE cur_get_age;
+        
+  
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+        
+    END AggregateAge;    
+
+
+-- PART C
+    PROCEDURE Residency (p_term IN varchar2) 
+    IS
+        v_spriden_id                  spriden.spriden_id%TYPE; 
+        v_spraddr_stat_code           spraddr.spraddr_stat_code%TYPE;
+        v_spraddr_natn_code           spraddr.spraddr_natn_code%TYPE;
+        v_sorhsch_graduation_date     sorhsch.sorhsch_graduation_date%TYPE;
+        v_sorhsch_admr_code           sorhsch.sorhsch_admr_code%TYPE; 
+        v_stvterm_start_date          stvterm.stvterm_start_date%TYPE;
+        v_num_of_months               number;  -- this variable is not actually needed, I just wanted to include the count in the query for checking purposes
+            
+        CURSOR cur_residence 
+        IS
+            SELECT spriden_id
+                  ,spraddr_stat_code
+                  ,spraddr_natn_code
+            FROM ipeds_spring_coll_details JOIN saradap ON (spriden_pidm = saradap_pidm AND TRUNC(spraddr_from_date) = TRUNC(saradap_appl_date)) 
+            WHERE cohort IN ('PART TIME, FIRST TIME, DEGREE SEEKING','FULL TIME, FIRST TIME, DEGREE SEEKING')
+                AND reporting_term = p_term;
+
+
+        CURSOR cur_highschool_graduation
+        IS
+            WITH column1 AS (
+                             SELECT spriden_pidm
+                                   ,spriden_id
+                                   ,spraddr_stat_code
+                                   ,spraddr_natn_code
+                                   ,sfrstcr_term_code
+                             FROM ipeds_spring_coll_details JOIN saradap ON (spriden_pidm = saradap_pidm AND TRUNC(spraddr_from_date) = TRUNC(saradap_appl_date)) 
+                             WHERE cohort IN ('PART TIME, FIRST TIME, DEGREE SEEKING','FULL TIME, FIRST TIME, DEGREE SEEKING')
+                                AND reporting_term = p_term
+                            )
+            SELECT c1.spriden_id
+                  ,c1.spraddr_stat_code
+                  ,c1.spraddr_natn_code
+                  ,sor.sorhsch_graduation_date
+                  ,sor.sorhsch_admr_code
+                  ,stv.stvterm_start_date
+                  ,TRUNC(MONTHS_BETWEEN(stv.stvterm_start_date, sor.sorhsch_graduation_date)) AS num_of_months
+            FROM column1 c1 
+                JOIN sorhsch sor ON (c1.spriden_pidm = sor.sorhsch_pidm)
+                JOIN stvterm stv ON (c1.sfrstcr_term_code = stv.stvterm_code)
+            WHERE sor.sorhsch_admr_code IN ('HSTF', 'GED')
+                AND stv.stvterm_code = p_term 
+                AND MONTHS_BETWEEN(stv.stvterm_start_date, sor.sorhsch_graduation_date) <= 12;   
+            
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+    BEGIN    
+                      
+        -- populate the table with the needed cohorts
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Alabama', '01', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Alaska', '02', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Arizona', '04', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Arkansas', '05', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('California', '06', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Colorado', '08', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Connecticut', '09', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Delaware', '10', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('District of Columbia', '11', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Florida', '12', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Georgia', '13', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Hawaii', '15', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Idaho', '16', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Illinois', '17', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Indiana', '18', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Iowa', '19', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Kansas', '20', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Kentucky', '21', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Louisiana', '22', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Maine', '23', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Maryland', '24', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Massachusetts', '25', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Michigan', '26', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Minnesota', '27', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Mississippi', '28', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Missouri', '29', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Montana', '30', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Nebraska', '31', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Nevada', '32', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('New Hampshire', '33', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('New Jersey', '34', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('New Mexico', '35', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('New York', '36', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('North Carolina', '37', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('North Dakota', '38', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Ohio', '39', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Oklahoma', '40', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Oregon', '41', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Pennsylvania', '42', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Rhode Island', '44', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('South Carolina', '45', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('South Dakota', '46', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Tennessee', '47', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Texas', '48', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Utah', '49', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Vermont', '50', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Virginia', '51', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Washington', '53', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('West Virginia', '54', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Wisconsin', '55', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Wyoming', '56', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('State Unknown', '57', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('American Samoa', '60', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Federated States of Micronesia', '64', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Guam', '66', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Marshall Islands', '68', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Northern Marianas', '69', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Palau', '70', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Puerto Rico', '72', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Virgin Islands', '78', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Foreign Countries', '90', 0, 0, p_term, SYSDATE); 
+        INSERT INTO ipeds_spring_residency_counts VALUES ('Residence unknown/unreported', '98', 0, 0, p_term, SYSDATE); 
+        COMMIT;
+
+                
+        OPEN cur_residence; 
+
+            LOOP 
+               v_spriden_id := '';  
+               v_spraddr_stat_code := '';
+               v_spraddr_natn_code := '';
+                 
+                FETCH cur_residence
+                   INTO v_spriden_id,
+                        v_spraddr_stat_code,
+                        v_spraddr_natn_code;
+                EXIT WHEN cur_residence%NOTFOUND;               
+                
+               
+                CASE 
+                    WHEN v_spraddr_stat_code = 'AL' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Alabama' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AK' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Alaska' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AS' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'American Samoa' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AZ' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Arizona' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AR' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Arkansas' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'CA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'California' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'CO' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Colorado' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'CT' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Connecticut' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'DE' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Delaware' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'DC' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'District of Columbia' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'FL' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Florida' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'GA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Georgia' AND reporting_term = p_term;   
+                    WHEN v_spraddr_stat_code = 'GU' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Guam' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'HI' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Hawaii' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'ID' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Idaho' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'IL' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Illinois' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'IN' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Indiana' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'IA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Iowa' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'KS' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Kansas' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'KY' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Kentucky' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'LA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Louisiana' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'ME' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Maine' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MD' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Maryland' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Massachusetts' AND reporting_term = p_term;                                             
+                    WHEN v_spraddr_stat_code = 'MI' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Michigan' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MN' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Minnesota' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MS' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Mississippi' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MO' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Missouri' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MT' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Montana' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NE' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Nebraska' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NV' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Nevada' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NH' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'New Hampshire' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NJ' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'New Jersey' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NM' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'New Mexico' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NY' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'New York' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NC' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'North Carolina' AND reporting_term = p_term;   
+                    WHEN v_spraddr_stat_code = 'ND' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'North Dakota' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'OH' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Ohio' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'OK' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Oklahoma' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'OR' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Oregon' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'PW' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Palau' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'PA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Pennsylvania' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'PR' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Puerto Rico' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'RI' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Rhode Island' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'SC' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'South Carolina' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'SD' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'South Dakota' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'TN' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Tennessee' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'TX' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Texas' AND reporting_term = p_term; 
+                    WHEN v_spraddr_stat_code = 'UT' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Utah' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'VT' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Vermont' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'VI' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Virgin Islands' AND reporting_term = p_term;   
+                    WHEN v_spraddr_stat_code = 'VA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Virginia' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WA' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Washington' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WV' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'West Virginia' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WI' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Wisconsin' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WY' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Wyoming' AND reporting_term = p_term;                          
+                    WHEN v_spraddr_stat_code IS NULL AND v_spraddr_natn_code = 'US' THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'State Unknown' AND reporting_term = p_term;      
+                    WHEN v_spraddr_stat_code IS NULL AND v_spraddr_natn_code IS NULL THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Residence unknown/unreported' AND reporting_term = p_term;      
+                    WHEN v_spraddr_stat_code IS NULL AND v_spraddr_natn_code != 'US' AND v_spraddr_natn_code IS NOT NULL THEN
+                        UPDATE ipeds_spring_residency_counts SET total = total + 1 WHERE STATE = 'Foreign Countries' AND reporting_term = p_term;                                                 
+                    ELSE DBMS_OUTPUT.PUT_LINE('RESIDENCY NOT REPORTED FOR ' || v_spriden_id); 
+                END CASE;
+                     
+                COMMIT;            
+         
+            END LOOP;
+            
+                        
+        CLOSE cur_residence;
+        
+        
+        OPEN cur_highschool_graduation; 
+
+            LOOP 
+               v_spriden_id := '';  
+               v_spraddr_stat_code := '';
+               v_spraddr_natn_code := '';
+               v_sorhsch_graduation_date := '';
+               v_sorhsch_admr_code := '';      
+               v_stvterm_start_date := '';    
+               v_num_of_months := '';     
+                
+                FETCH cur_highschool_graduation
+                   INTO v_spriden_id,
+                        v_spraddr_stat_code,
+                        v_spraddr_natn_code,
+                        v_sorhsch_graduation_date,
+                        v_sorhsch_admr_code, 
+                        v_stvterm_start_date,
+                        v_num_of_months;
+                EXIT WHEN cur_highschool_graduation%NOTFOUND;               
+               
+               
+                CASE 
+                    WHEN v_spraddr_stat_code = 'AL' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Alabama' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AK' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Alaska' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AS' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'American Samoa' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AZ' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Arizona' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'AR' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Arkansas' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'CA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'California' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'CO' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Colorado' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'CT' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Connecticut' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'DE' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Delaware' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'DC' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'District of Columbia' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'FL' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Florida' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'GA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Georgia' AND reporting_term = p_term;   
+                    WHEN v_spraddr_stat_code = 'GU' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Guam' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'HI' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Hawaii' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'ID' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Idaho' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'IL' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Illinois' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'IN' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Indiana' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'IA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Iowa' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'KS' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Kansas' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'KY' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Kentucky' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'LA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Louisiana' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'ME' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Maine' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MD' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Maryland' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Massachusetts' AND reporting_term = p_term;                                             
+                    WHEN v_spraddr_stat_code = 'MI' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Michigan' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MN' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Minnesota' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MS' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Mississippi' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MO' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Missouri' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'MT' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Montana' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NE' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Nebraska' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NV' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Nevada' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NH' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'New Hampshire' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NJ' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'New Jersey' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NM' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'New Mexico' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NY' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'New York' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'NC' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'North Carolina' AND reporting_term = p_term;   
+                    WHEN v_spraddr_stat_code = 'ND' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'North Dakota' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'OH' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Ohio' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'OK' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Oklahoma' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'OR' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Oregon' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'PW' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Palau' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'PA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Pennsylvania' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'PR' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Puerto Rico' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'RI' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Rhode Island' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'SC' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'South Carolina' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'SD' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'South Dakota' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'TN' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Tennessee' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'TX' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Texas' AND reporting_term = p_term; 
+                    WHEN v_spraddr_stat_code = 'UT' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Utah' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'VT' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Vermont' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'VI' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Virgin Islands' AND reporting_term = p_term;   
+                    WHEN v_spraddr_stat_code = 'VA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Virginia' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WA' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Washington' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WV' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'West Virginia' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WI' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Wisconsin' AND reporting_term = p_term;  
+                    WHEN v_spraddr_stat_code = 'WY' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Wyoming' AND reporting_term = p_term;                          
+                    WHEN v_spraddr_stat_code IS NULL AND v_spraddr_natn_code = 'US' THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'State Unknown' AND reporting_term = p_term;      
+                    WHEN v_spraddr_stat_code IS NULL AND v_spraddr_natn_code IS NULL THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Residence unknown/unreported' AND reporting_term = p_term;      
+                    WHEN v_spraddr_stat_code IS NULL AND v_spraddr_natn_code != 'US' AND v_spraddr_natn_code IS NOT NULL THEN
+                        UPDATE ipeds_spring_residency_counts SET within_12_months = within_12_months + 1 WHERE STATE = 'Foreign Countries' AND reporting_term = p_term;  
+                    ELSE DBMS_OUTPUT.PUT_LINE('HIGH SCHOOL GRADUATION RESIDENCY NOT REPORTED FOR ' || v_spriden_id); 
+                END CASE;
+                    
+                COMMIT;            
+         
+            END LOOP;
+            
+                        
+        CLOSE cur_highschool_graduation;
+
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+        
+    END Residency;  
+ 
+
+-- PART D
+ PROCEDURE TotalUndergraduateEnteringClass (p_term IN varchar2) 
+    IS
+        v_spriden_pidm    spriden.spriden_pidm%TYPE; 
+        v_cohort          varchar2(200);
+        v_count           number; 
+        v_term            varchar2(10);
+        v_ccp_new         number;        
+        
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+    BEGIN  
+        
+        v_term := 'Fall ' || SUBSTR(p_term, 1, 4);       
+
+      
+        -- ccp students who are new to the institution
+        WITH first_term AS (
+                             SELECT sgbstdn_pidm, MIN(sgbstdn_term_code_eff) AS sgbstdn_term_code_eff
+                             FROM sgbstdn
+                             GROUP BY sgbstdn_pidm
+                           ),
+             stu_rec AS (
+                          SELECT b.spriden_pidm, b.sgbstdn_term_code_eff
+                          FROM first_term a JOIN ipeds_spring_coll_details b ON (a.sgbstdn_pidm = b.spriden_pidm AND a.sgbstdn_term_code_eff = b.sgbstdn_term_code_eff)
+                          WHERE b.sgbstdn_styp_code = 'H'
+                             AND b.cohort LIKE '%NON-DEGREE%'
+                             AND b.sgbstdn_term_code_eff = p_term
+                          GROUP BY b.spriden_pidm, b.sgbstdn_term_code_eff
+                        )
+        SELECT COUNT(*)
+        INTO v_ccp_new
+        FROM stu_rec;
+        
+        DBMS_OUTPUT.PUT_LINE('v_ccp_new = ' || v_ccp_new); 
+        
+
+        INSERT INTO sis_apps.ipeds_spring_total_entering_class 
+        VALUES ('D1 - Total full-time, first-time degree/certificate-seeking undergraduates from Part A', 0, p_term, SYSDATE);  
+        
+        INSERT INTO sis_apps.ipeds_spring_total_entering_class 
+        VALUES ('D2 - Total first-time degree/certificate-seeking undergraduates (full-time + part-time) from Part A', 0, p_term, SYSDATE);  
+        
+        INSERT INTO sis_apps.ipeds_spring_total_entering_class 
+        VALUES ('D3 - Total transfer-in degree/certificate-seeking undergraduates (full-time + part-time) from Part A', 0, p_term, SYSDATE);  
+      
+        INSERT INTO sis_apps.ipeds_spring_total_entering_class 
+        VALUES ('D4 - Total non-degree/non-certificate-seeking undergraduates (full-time + part-time) from Part A', 0, p_term, SYSDATE);  
+        
+        INSERT INTO sis_apps.ipeds_spring_total_entering_class 
+        VALUES ('D5 - Of the total non-degree/non-certificate-seeking undergraduates displayed on line D4, the number that are new to the institution in ' || v_term, 0, p_term, SYSDATE);  
+        
+        INSERT INTO sis_apps.ipeds_spring_total_entering_class 
+        VALUES ('D6 - Total entering students at the undergraduate level', 0, p_term, SYSDATE);  
+      
+        INSERT INTO sis_apps.ipeds_spring_total_entering_class 
+        VALUES ('D7 - Percentage of undergraduate entering class represented by your GR cohort (line D1/line D6)', 0, p_term, SYSDATE);  
+        
+        COMMIT;
+           
+        UPDATE sis_apps.ipeds_spring_total_entering_class tot
+        SET tot.count = (SELECT COUNT(*) FROM ipeds_spring_coll_details det WHERE det.cohort LIKE 'FULL TIME, FIRST TIME%' AND det.reporting_term = p_term) 
+        WHERE tot.cohort LIKE 'D1 -%' AND tot.reporting_term = p_term;   
+        
+        UPDATE sis_apps.ipeds_spring_total_entering_class tot 
+        SET tot.count = (SELECT COUNT(*) FROM ipeds_spring_coll_details det WHERE det.cohort LIKE '%FIRST TIME%' AND det.reporting_term = p_term) 
+        WHERE tot.cohort LIKE 'D2 -%' AND tot.reporting_term = p_term;   
+        
+        UPDATE sis_apps.ipeds_spring_total_entering_class tot
+        SET tot.count = (SELECT COUNT(*) FROM ipeds_spring_coll_details det WHERE det.cohort LIKE '%TRANSFER%' AND det.reporting_term = p_term) 
+        WHERE tot.cohort LIKE 'D3 -%' AND tot.reporting_term = p_term;    
+       
+        UPDATE sis_apps.ipeds_spring_total_entering_class tot
+        SET COUNT = (SELECT COUNT(*) FROM ipeds_spring_coll_details det WHERE det.cohort LIKE '%NON-DEGREE%' AND det.reporting_term = p_term) 
+        WHERE tot.cohort LIKE 'D4 -%' AND tot.reporting_term = p_term;   
+ 
+        UPDATE sis_apps.ipeds_spring_total_entering_class tot
+        SET tot.count = v_ccp_new + (SELECT COUNT(*) FROM ipeds_spring_coll_details det WHERE det.cohort LIKE '%NON-DEGREE%' AND det.sgbstdn_styp_code IN ('N','T') AND det.reporting_term = p_term) 
+        WHERE tot.cohort LIKE 'D5 -%' AND tot.reporting_term = p_term;     
+        
+        COMMIT;
+
+        UPDATE sis_apps.ipeds_spring_total_entering_class tot
+        SET tot.count = ((SELECT DISTINCT(det.count) FROM ipeds_spring_total_entering_class det WHERE det.cohort LIKE 'D2 -%' AND det.reporting_term = p_term) + 
+                         (SELECT DISTINCT(det.count) FROM ipeds_spring_total_entering_class det WHERE det.cohort LIKE 'D3 -%' AND det.reporting_term = p_term) + 
+                         (SELECT DISTINCT(det.count) FROM ipeds_spring_total_entering_class det WHERE det.cohort LIKE 'D5 -%' AND det.reporting_term = p_term)) 
+        WHERE tot.cohort LIKE 'D6 -%' AND tot.reporting_term = p_term;    
+        
+        COMMIT;
+
+        UPDATE sis_apps.ipeds_spring_total_entering_class tot
+        SET tot.count = TRUNC(((SELECT DISTINCT(det.count) FROM ipeds_spring_total_entering_class det WHERE det.cohort LIKE 'D1 -%' AND det.reporting_term = p_term) / 
+                         (SELECT DISTINCT(det.count) FROM ipeds_spring_total_entering_class det WHERE det.cohort LIKE 'D6 -%' AND det.reporting_term = p_term)) * 100)
+        WHERE tot.cohort LIKE 'D7 -%' AND tot.reporting_term = p_term;  
+      
+        COMMIT; 
+
+
+    END TotalUndergraduateEnteringClass;   
+    
+    
+-- PART E
+    PROCEDURE RetentionRates (p_year IN NUMBER)  
+    IS
+        v_spriden_id                  spriden.spriden_id%TYPE; 
+        v_spbpers_dead_ind            spbpers.spbpers_dead_ind%TYPE;
+        v_cohort                      varchar2(10);
+        v_year                        varchar2(4); 
+        v_last_year                   number; 
+
+-- this procedure requires manual intervention because it is comparing the reporting Fall term to the previous Fall term
+-- run part A to get the details table, then run this SQL to get the retention counts for that term
+    -- C:\Users\rbarrin3\OneDrive - University of Toledo\Desktop\SQL\create ipeds_fall_enrollment_201940 table used in the ipeds spring collection retention counts.sql
+-- replace the table in these two cursors with the new table and then run this procedure
+-- I did it this way to get the correct counts, Sherri wanted it moved to TSPROD
+-- will revisit taking out the manual portion of this
+
+-- newer update: tell it to search the details table for the reporting term that fits this
+-- select stvterm_code from stvterm where stvterm_acyr_code = p_year;
+
+/*               
+        CURSOR cur_retention 
+        IS
+            SELECT a.spriden_id
+                  ,b.spbpers_dead_ind
+                  ,c.cohort
+            FROM spriden a 
+                JOIN spbpers b ON (a.spriden_pidm = b.spbpers_pidm) 
+                JOIN sis_apps.ipeds_spring_coll_details c ON (a.spriden_id = c.spriden_id AND c.reporting_term = '201940')
+            WHERE a.spriden_change_ind IS NULL
+                AND c.cohort IN ('FULL TIME, FIRST TIME, DEGREE SEEKING', 'PART TIME, FIRST TIME, DEGREE SEEKING');
+
+        CURSOR cur_retention_e4_and_e9
+        IS
+            WITH records AS (
+                             SELECT b.spriden_id, b.cohort
+                             FROM ipeds_spring_coll_details a 
+                                JOIN sis_apps.ipeds_spring_coll_details b ON (a.spriden_id = b.spriden_id AND a.reporting_term = '202040' AND b.reporting_term = '201940') 
+                             WHERE b.cohort IN ('FULL TIME, FIRST TIME, DEGREE SEEKING', 'PART TIME, FIRST TIME, DEGREE SEEKING')
+                             UNION
+                             SELECT c.spriden_id, c.cohort
+                             FROM shrdgmr a 
+                                JOIN spriden b ON (a.shrdgmr_pidm = b.spriden_pidm)
+                                JOIN sis_apps.ipeds_spring_coll_details c ON (b.spriden_id = c.spriden_id AND c.reporting_term = '201940')
+                             WHERE b.spriden_change_ind IS NULL
+                               AND c.cohort IN ('FULL TIME, FIRST TIME, DEGREE SEEKING', 'PART TIME, FIRST TIME, DEGREE SEEKING')
+                            ),
+                 dedupe AS (
+                            SELECT spriden_id
+                                  ,cohort
+                                  ,ROW_NUMBER() OVER (PARTITION BY spriden_id ORDER BY ROWNUM) rk -- deduping because people could have multiple degrees causing multiple records
+                            FROM records a
+                           )
+            SELECT spriden_id, cohort
+            FROM dedupe 
+            WHERE rk = 1;
+*/            
+
+    
+        -- this cursor is getting the spbpers_dead_ind for each person, this field is already in the details table, so it may not be needed here
+        CURSOR cur_retention 
+        IS
+            SELECT a.spriden_id
+                  ,b.spbpers_dead_ind
+                  ,c.code
+            FROM spriden a JOIN spbpers b ON (a.spriden_pidm = b.spbpers_pidm) 
+                           JOIN sis_apps.ipeds_fall_enrollment_202040 c ON (a.spriden_id = c.spriden_id)
+            WHERE a.spriden_change_ind IS NULL
+                AND c.code IN ('FT-FT', 'PT-FT');
+
+        CURSOR cur_retention_e4_and_e9
+        IS
+            WITH records AS (
+                             SELECT b.spriden_id, b.code
+                             FROM ipeds_spring_coll_details a JOIN sis_apps.ipeds_fall_enrollment_202040 b ON (a.spriden_id = b.spriden_id) 
+                             WHERE b.code IN ('FT-FT', 'PT-FT')
+                             UNION
+                             SELECT c.spriden_id, c.code
+                             FROM shrdgmr a JOIN spriden b ON (a.shrdgmr_pidm = b.spriden_pidm)
+                                            JOIN sis_apps.ipeds_fall_enrollment_202040 c ON (b.spriden_id = c.spriden_id) 
+                             WHERE b.spriden_change_ind IS NULL
+                               AND c.code IN ('FT-FT', 'PT-FT')
+                            ),
+                 dedupe AS (
+                            SELECT spriden_id
+                                  ,code
+                                  ,ROW_NUMBER() OVER (PARTITION BY spriden_id ORDER BY ROWNUM) rk -- deduping because people could have multiple degrees causing multiple records
+                            FROM records a
+                           )
+            SELECT spriden_id, code
+            FROM dedupe 
+            WHERE rk = 1;
+
+
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+    BEGIN    
+        
+        v_year := p_year;
+        v_last_year := v_year - 1;        
+                
+        -- populate the table with the needed cohorts
+        INSERT INTO ipeds_spring_retention 
+        VALUES (v_year, 'E1 - Full-time, First-time Fall ' || v_last_year || ' cohort', 0);
+        
+        INSERT INTO ipeds_spring_retention 
+        VALUES (v_year, 'E2a - Full-time, Exclusions from the Fall ' || v_last_year || ' cohort', 0);
+        
+        INSERT INTO ipeds_spring_retention 
+        VALUES (v_year, 'E2b - Full-time, Inclusions to the Fall ' || v_last_year || ' cohort', 0); -- this value will always be 0 (per Sherri)
+        
+        INSERT INTO ipeds_spring_retention 
+        VALUES (v_year, 'E4 - Full-time, Students from Fall ' || v_last_year || ' cohort who are still enrolled + students from Fall ' || v_last_year || ' cohort who completed their program as of Fall ' || v_year, 0);
+       
+        INSERT INTO ipeds_spring_retention 
+        VALUES (v_year, 'E6 - Part-time, First-time Fall ' || v_last_year || ' cohort', 0);
+        
+        INSERT INTO ipeds_spring_retention
+        VALUES (v_year, 'E7a - Part-time, Exclusions from the Fall ' || v_last_year || ' cohort', 0);
+        
+        INSERT INTO ipeds_spring_retention
+        VALUES (v_year, 'E7b - Part-time, Inclusions to the Fall ' || v_last_year || ' cohort', 0); -- this value will always be 0 (per Sherri)
+        
+        INSERT INTO ipeds_spring_retention 
+        VALUES (v_year, 'E9 - Part-time, Students from Fall ' || v_last_year || ' cohort who are still enrolled + students from Fall ' || v_last_year || ' cohort who completed their program as of Fall ' || v_year, 0);
+        
+        COMMIT;
+
+        OPEN cur_retention; 
+
+            LOOP 
+               v_spriden_id := '';  
+               v_spbpers_dead_ind := '';
+               v_cohort := '';            
+                 
+                FETCH cur_retention
+                   INTO v_spriden_id,
+                        v_spbpers_dead_ind,
+                        v_cohort;
+                EXIT WHEN cur_retention%NOTFOUND;               
+                
+               
+                    IF v_cohort = 'FT-FT' THEN
+                        IF v_spbpers_dead_ind IS NULL THEN 
+                            UPDATE ipeds_spring_retention 
+                            SET count_students = count_students + 1 
+                            WHERE cohort_retention LIKE ('E1 -%') AND acyr = v_year;
+                        ELSIF v_spbpers_dead_ind IS NOT NULL THEN 
+                            UPDATE ipeds_spring_retention 
+                            SET count_students = count_students + 1 
+                            WHERE cohort_retention LIKE ('E2a -%') AND acyr = v_year;
+                        END IF;
+                    ELSIF v_cohort = 'PT-FT' THEN
+                        IF v_spbpers_dead_ind IS NULL THEN 
+                            UPDATE ipeds_spring_retention 
+                            SET count_students = count_students + 1 
+                            WHERE cohort_retention LIKE ('E6 -%') AND acyr = v_year;
+                        ELSIF v_spbpers_dead_ind IS NOT NULL THEN 
+                            UPDATE ipeds_spring_retention 
+                            SET count_students = count_students + 1 
+                            WHERE cohort_retention LIKE ('E7a -%') AND acyr = v_year;
+                        END IF; 
+                    END IF;
+                
+                COMMIT;            
+         
+            END LOOP;
+            
+                        
+        CLOSE cur_retention;
+        
+        OPEN cur_retention_e4_and_e9; 
+
+            LOOP 
+               v_spriden_id := '';  
+               v_cohort := '';            
+                 
+                FETCH cur_retention_e4_and_e9
+                   INTO v_spriden_id,
+                        v_cohort;
+                EXIT WHEN cur_retention_e4_and_e9%NOTFOUND;               
+                
+               
+                    IF v_cohort = 'FT-FT' THEN
+                        UPDATE ipeds_spring_retention 
+                        SET count_students = count_students + 1 
+                        WHERE cohort_retention LIKE ('E4 -%') AND acyr = v_year;  
+                    ELSIF v_cohort = 'PT-FT' THEN
+                        UPDATE ipeds_spring_retention 
+                        SET count_students = count_students + 1 
+                        WHERE cohort_retention LIKE ('E9 -%') AND acyr = v_year;   
+                    END IF;
+                
+                COMMIT;            
+         
+            END LOOP;
+                        
+        CLOSE cur_retention_e4_and_e9;
+
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+        
+    END RetentionRates;    
+  
+
+-- PART F
+    PROCEDURE StudentToFaculty (p_term IN varchar2) 
+    IS
+		v_spriden_pidm                spriden.spriden_pidm%TYPE; 
+		v_spriden_id                  spriden.spriden_id%TYPE; 
+		v_spriden_last_name           spriden.spriden_last_name%TYPE; 
+		v_spriden_first_name          spriden.spriden_first_name%TYPE; 
+        v_eeo_code_desc               ptveskl.ptveskl_desc%TYPE;
+        v_nbajobs_pay_id              nbrjobs.nbrjobs_pict_code%TYPE;
+		v_scbcrse_credit_hr_low       scbcrse.scbcrse_credit_hr_low%TYPE; 
+		v_scbcrse_credit_hr_high      scbcrse.scbcrse_credit_hr_high%TYPE;  
+		v_ssbsect_crn                 ssbsect.ssbsect_crn%TYPE; 
+		v_ssbsect_term_code           ssbsect.ssbsect_term_code%TYPE;
+		v_ssbsect_enrl                ssbsect.ssbsect_enrl%TYPE;
+        v_ssbsect_gradable_ind        ssbsect.ssbsect_gradable_ind%TYPE;
+        v_scbcrse_eff_term            scbcrse.scbcrse_eff_term%TYPE;
+        v_report_date                 varchar2(8):= SUBSTR(p_term, 1,4) || '1101';     
+        
+
+        CURSOR cur_stu_to_fac
+        IS
+            WITH fte_total AS (
+                               SELECT fte.nbrjobs_pidm
+                                     ,SUM(fte.nbrjobs_fte) AS total_fte
+                               FROM posnctl.nbrjobs fte
+                                    WHERE fte.nbrjobs_status <>'T' AND
+                                          fte.nbrjobs_effective_date = (
+                                                                        SELECT MAX(nbrjobs_effective_date)
+                                                                        FROM posnctl.nbrjobs fte2
+                                                                        WHERE fte.nbrjobs_pidm = fte2.nbrjobs_pidm AND
+                                                                              fte.nbrjobs_posn = fte2.nbrjobs_posn AND
+                                                                              fte.nbrjobs_suff = fte2.nbrjobs_suff AND
+                                                                              fte2.nbrjobs_effective_date <= TO_DATE(v_report_date,'yyyymmdd')
+                                                                       )
+                               GROUP BY fte.nbrjobs_pidm
+                              ),
+                 email AS (
+                           SELECT g1.goremal_pidm
+                                 ,g1.goremal_emal_code
+                                 ,g1.goremal_email_address
+                           FROM goremal g1
+                           WHERE g1.goremal_emal_code = 'UNIV' AND 
+                                 g1.goremal_status_ind = 'A' AND 
+                                 g1.goremal_activity_date = (
+                                                             SELECT MAX(goremal_activity_date)
+                                                             FROM goremal g2
+                                                             WHERE g1.goremal_pidm = g2.goremal_pidm AND 
+                                                                   g1.goremal_emal_code = g2.goremal_emal_code
+                                                            )
+                          ),
+                 sup_email AS (
+                               SELECT g1.goremal_pidm
+                                     ,g1.goremal_emal_code
+                                     ,g1.goremal_email_address
+                               FROM goremal g1
+                               WHERE g1.goremal_emal_code = 'UNIV' AND 
+                                     g1.goremal_status_ind = 'A' AND 
+                                     g1.goremal_activity_date = (
+                                                                 SELECT MAX(goremal_activity_date)
+                                                                 FROM goremal g2
+                                                                 WHERE  g1.goremal_pidm = g2.goremal_pidm AND 
+                                                                        g1.goremal_emal_code = g2.goremal_emal_code
+                                                                )
+                          ),
+                 employee AS ( -- show all employees on the reporting date set by IPEDS
+                                  SELECT /*+ opt_param('_optimizer_use_feedback' 'false') */
+                                         sp.spriden_pidm
+                                        ,sp.spriden_id
+                                        ,sp.spriden_last_name 
+                                        ,sp.spriden_first_name 
+                                        ,sp.spriden_mi AS mi
+                                        ,sb.spbpers_name_prefix AS name_prefix
+                                        ,sb.spbpers_name_suffix AS name_suffix
+                                        ,jb1.nbrjobs_posn AS nbajobs_position
+                                        ,'="'||jb1.nbrjobs_suff||'"' AS nbajobs_suff
+                                        ,nb.nbrbjob_contract_type AS nbajobs_contract_type
+                                        ,ph1.nbrposh_ecls_code AS nbaposn_emp_class
+                                        ,ec.ptrecls_long_desc AS employee_class_desc
+                                        ,ph1.nbrposh_pcls_code AS nbaposn_pos_class
+                                        ,pc.ntrpcls_desc AS position_class_desc
+                                        ,ph1.nbrposh_exempt_ind AS nbaposn_exempt_ind
+                                        ,pc.ntrpcls_eskl_code AS eeo_code
+                                        ,pt1.ptveskl_desc AS eeo_code_desc
+                                        ,jb1.nbrjobs_status AS nbajobs_job_status
+                                        ,jb1.nbrjobs_desc AS nbajobs_title
+                                        ,ph1.nbrposh_title AS nbaposn_title
+                                        ,jb1.nbrjobs_ecls_code AS nbajobs_emp_class
+                                        ,ec.ptrecls_long_desc AS nbajobs_emp_class_desc
+                                        ,jb1.nbrjobs_pict_code AS nbajobs_pay_id
+                                        ,jb1.nbrjobs_orgn_code_ts AS nbajobs_timesheet_org
+                                        ,og.ftvorgn_title AS nbajobs_timesheet_org_desc
+                                        ,tot1.nbrptot_orgn_code AS nbapbud_org
+                                        ,og3.ftvorgn_title AS nbapbud_org_desc
+                                        ,jb1.nbrjobs_sal_table AS nbajobs_sal_table
+                                        ,jb1.nbrjobs_sal_grade AS nbajobs_sal_grade
+                                        ,jb1.nbrjobs_sal_step AS nbajobs_sal_step
+                                        ,jb1.nbrjobs_lgcd_code AS nbajobs_lgcd_code
+                                        ,nt.ntrsalb_ind AS ntrsalb_ind
+                                        ,jb1.nbrjobs_appt_pct AS nbajobs_appt_pct
+                                        ,jb1.nbrjobs_fte AS nbajobs_fte
+                                        ,fte_total.total_fte
+                                        ,jb1.nbrjobs_hrs_day AS nbajobs_hrs_day
+                                        ,jb1.nbrjobs_hrs_pay AS nbajobs_hrs_pay
+                                        ,jb1.nbrjobs_shift AS nbajobs_shift
+                                        ,jb1.nbrjobs_reg_rate AS nbajobs_reg_rate
+                                        ,jb1.nbrjobs_factor AS nbajobs_factor
+                                        ,jb1.nbrjobs_ann_salary AS nbajobs_ann_salary
+                                        ,jb1.nbrjobs_per_pay_salary AS nbajobs_per_pay_salary
+                                        ,jb1.nbrjobs_pays AS nbajobs_pays
+                                        ,jb1.nbrjobs_pers_chg_date AS nbajobs_pers_chg_date
+                                        ,jb1.nbrjobs_effective_date AS nbajobs_effective_date
+                                        ,jb1.nbrjobs_jcre_code AS nbajobs_jcre_code
+                                        ,jc.ptrjcre_desc AS jcre_code_desc
+                                        ,jb1.nbrjobs_sgrp_code AS nbajobs_sgrp_code
+                                        ,jb1.nbrjobs_dfpr_code AS nbajobs_depr_code
+                                        ,jb1.nbrjobs_time_entry_method AS nbajobs_time_entry_method
+                                        ,jb1.nbrjobs_time_entry_type AS nbajobs_time_entry_type
+                                        ,jb1.nbrjobs_time_in_out_ind AS nbajobs_time_in_out_ind
+                                        ,jb1.nbrjobs_leav_rept_method AS nbajobs_leav_rept_method
+                                        ,jb1.nbrjobs_pict_code_leav_rept AS nbajobs_pict_code_leav_rept
+                                        ,NVL(eh1.perehis_empl_status, pb.pebempl_empl_status) AS peaempl_empl_status
+                                        ,CASE WHEN eh1.perehis_home_orgn IS NOT NULL THEN eh1.perehis_home_orgn ELSE pb.pebempl_orgn_code_home END AS peaempl_home_dept
+                                        ,og2.ftvorgn_title AS peaempl_home_dept_desc
+                                        ,NVL(eh1.perehis_ecls_code, pb.pebempl_ecls_code) AS peaempl_emp_class
+                                        ,ec.ptrecls_long_desc AS peaempl_emp_class_desc
+                                        ,NVL(eh1.perehis_lcat_code, pb.pebempl_lcat_code) AS peaempl_lcat_code
+                                        ,NVL(eh1.perehis_bcat_code, pb.pebempl_bcat_code) AS peaempl_bcat_code
+                                        ,NVL(eh1.perehis_first_hire_date, pb.pebempl_first_hire_date) AS peaempl_first_hire_date
+                                        ,NVL(eh1.perehis_current_hire_date, pb.pebempl_current_hire_date) AS peaempl_current_hire_date
+                                        ,NVL(eh1.perehis_adj_service_date, pb.pebempl_adj_service_date) AS peaempl_adj_service_date
+                                        ,NVL(eh1.perehis_seniority_date, pb.pebempl_seniority_date) AS peaempl_seniority_date
+                                        ,NVL(eh1.perehis_lrea_code, pb.pebempl_lrea_code) AS peaempl_lrea_code
+                                        ,NVL(eh1.perehis_loa_beg_date, pb.pebempl_loa_beg_date) AS peaempl_loa_beg_date
+                                        ,NVL(eh1.perehis_loa_end_date, pb.pebempl_loa_end_date) AS peaempl_loa_end_date
+                                        ,NVL(eh1.perehis_trea_code, pb.pebempl_trea_code) AS peaempl_trea_code
+                                        ,NVL(eh1.perehis_term_date, pb.pebempl_term_date) AS peaempl_term_date
+                                        ,NVL(eh1.perehis_internal_ft_pt_ind, pb.pebempl_internal_ft_pt_ind) AS peaempl_internal_ft_pt_ind
+                                        ,CASE WHEN eh1.perehis_jbln_code IS NOT NULL THEN eh1.perehis_jbln_code ELSE pb.pebempl_jbln_code END AS peaempl_jbln_code
+                                        ,lc2.ptrjbln_desc AS peaempl_jbln_desc
+                                        ,NVL(eh1.perehis_coll_code, pb.pebempl_coll_code) AS peaempl_coll_code
+                                        ,NVL(eh1.perehis_camp_code, pb.pebempl_camp_code) AS peaempl_camp_code
+                                        ,nb.nbrbjob_step_incr_day AS nbajobs_step_incr_day
+                                        ,nb.nbrbjob_step_incr_mon AS nbajobs_step_incr_month
+                                        ,sb.spbpers_birth_date AS dob
+                                        ,((TO_DATE(v_report_date,'yyyymmdd') - sb.spbpers_birth_date)/365.25) AS age
+                                        ,sb.spbpers_sex AS gender
+                                        ,sb.spbpers_ethn_code AS spapers_ethn_code
+                                        ,sv.stvethn_desc AS ethn_code_desc
+                                        ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE sp2.spriden_id END AS nbajobs_supervisor_id
+                                        ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE sup_email.goremal_email_address END AS supervisor_univ_email
+                                        ,jb1.nbrjobs_supervisor_posn AS nbajobs_supervisor_posn
+                                        ,CASE WHEN jb1.nbrjobs_supervisor_suff IS NOT NULL THEN '="'||jb1.nbrjobs_supervisor_suff||'"' ELSE '' END AS nbajobs_supervisor_suff
+                                        ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE jb3.nbrjobs_desc END AS supervisor_title
+                                        ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE (sp2.spriden_last_name||', '||sp2.spriden_first_name) END AS supervisor_name
+                                        ,pb2.pebempl_empl_status AS supervisor_status
+                                        ,email.goremal_email_address AS univ_email
+                                  FROM posnctl.nbrjobs jb1
+                                      JOIN saturn.spriden sp ON (jb1.nbrjobs_pidm = sp.spriden_pidm)
+                                      JOIN payroll.ptrecls ec ON (jb1.nbrjobs_ecls_code = ec.ptrecls_code)
+                                      LEFT OUTER JOIN payroll.ptrjcre jc ON (jb1.nbrjobs_jcre_code = jc.ptrjcre_code)
+                                      JOIN posnctl.nbrbjob nb ON (jb1.nbrjobs_pidm = nb.nbrbjob_pidm AND
+                                                                  jb1.nbrjobs_posn = nb.nbrbjob_posn AND
+                                                                  jb1.nbrjobs_suff = nb.nbrbjob_suff)
+                                      LEFT OUTER JOIN posnctl.nbrposh ph1 ON (jb1.nbrjobs_posn = ph1.nbrposh_posn)
+                                      LEFT OUTER JOIN posnctl.ntrpcls pc ON (ph1.nbrposh_pcls_code = pc.ntrpcls_code)
+                                      LEFT OUTER JOIN payroll.ptveskl pt1 ON (pc.ntrpcls_eskl_code = pt1.ptveskl_code)
+                                      LEFT OUTER JOIN fimsmgr.ftvorgn og ON (jb1.nbrjobs_orgn_code_ts = og.ftvorgn_orgn_code AND 
+                                                                             og.ftvorgn_coas_code = 'A')
+                                      LEFT OUTER JOIN posnctl.ntrsalb nt ON (jb1.nbrjobs_sal_table = nt.ntrsalb_table AND
+                                                                             jb1.nbrjobs_sal_grade = nt.ntrsalb_grade AND
+                                                                             jb1.nbrjobs_sgrp_code = nt.ntrsalb_sgrp_code)
+                                      LEFT OUTER JOIN payroll.ptrjbln lc ON (jb1.nbrjobs_jbln_code = lc.ptrjbln_code)
+                                      LEFT OUTER JOIN payroll.perehis eh1 ON (jb1.nbrjobs_pidm = eh1.perehis_pidm)
+                                      LEFT OUTER JOIN saturn.spbpers sb ON (jb1.nbrjobs_pidm = sb.spbpers_pidm)
+                                      LEFT OUTER JOIN saturn.stvethn sv ON (sb.spbpers_ethn_code = sv.stvethn_code)
+                                      LEFT OUTER JOIN saturn.spriden sp2 ON (sp2.spriden_pidm = CASE WHEN jb1.nbrjobs_supervisor_pidm IS NOT NULL THEN jb1.nbrjobs_supervisor_pidm ELSE 999999999 END)
+                                      LEFT OUTER JOIN posnctl.nbrjobs jb3 ON (jb3.nbrjobs_pidm = jb1.nbrjobs_supervisor_pidm AND
+                                                                              jb3.nbrjobs_posn = jb1.nbrjobs_supervisor_posn AND
+                                                                              jb3.nbrjobs_suff = jb1.nbrjobs_supervisor_suff)
+                                      JOIN fte_total ON (fte_total.nbrjobs_pidm = jb1.nbrjobs_pidm)
+                                      JOIN payroll.pebempl pb ON (jb1.nbrjobs_pidm = pb.pebempl_pidm)
+                                      LEFT OUTER JOIN fimsmgr.ftvorgn og2 ON (og2.ftvorgn_orgn_code = CASE WHEN eh1.perehis_home_orgn IS NOT NULL THEN eh1.perehis_home_orgn ELSE pb.pebempl_orgn_code_home END AND 
+                                                                              og2.ftvorgn_coas_code = 'A')
+                                      LEFT OUTER JOIN payroll.ptrjbln lc2 ON (pebempl_jbln_code = lc2.ptrjbln_code)
+                                      LEFT OUTER JOIN posnctl.nbrptot tot1 ON (jb1.nbrjobs_posn = tot1.nbrptot_posn)
+                                      LEFT OUTER JOIN fimsmgr.ftvorgn og3 ON (og3.ftvorgn_orgn_code = tot1.nbrptot_orgn_code AND 
+                                                                              og3.ftvorgn_coas_code = 'A')
+                                      LEFT OUTER JOIN general.gtvdicd div ON (pebempl_dicd_code = div.gtvdicd_code)
+                                      LEFT OUTER JOIN email ON (jb1.nbrjobs_pidm = email.goremal_pidm)
+                                      LEFT OUTER JOIN sup_email ON (jb1.nbrjobs_supervisor_pidm = sup_email.goremal_pidm)
+                                      LEFT OUTER JOIN payroll.pebempl pb2 ON (jb1.nbrjobs_supervisor_pidm = pb2.pebempl_pidm)
+                                  WHERE jb1.nbrjobs_status <> 'T' AND
+                                        jb1.nbrjobs_effective_date = (
+                                                                      SELECT MAX(nbrjobs_effective_date)
+                                                                      FROM nbrjobs jb2
+                                                                      WHERE jb1.nbrjobs_pidm = jb2.nbrjobs_pidm AND
+                                                                            jb1.nbrjobs_posn = jb2.nbrjobs_posn AND
+                                                                            jb1.nbrjobs_suff = jb2.nbrjobs_suff AND
+                                                                            jb2.nbrjobs_effective_date <= TO_DATE(v_report_date,'yyyymmdd')
+                                                                     ) AND 
+                                        sp.spriden_change_ind IS NULL AND
+                                        nb.nbrbjob_begin_date <= TO_DATE(v_report_date,'yyyymmdd') AND 
+                                        (nb.nbrbjob_end_date >= TO_DATE(v_report_date,'yyyymmdd') OR nb.nbrbjob_end_date IS NULL) AND
+                                        ph1.nbrposh_change_date_time = (
+                                                                        SELECT MAX(nbrposh_change_date_time)
+                                                                        FROM nbrposh ph2
+                                                                        WHERE ph1.nbrposh_posn = ph2.nbrposh_posn AND
+                                                                              ph2.nbrposh_change_date_time <= TO_DATE(v_report_date,'yyyymmdd')
+                                                                       ) AND
+                                        pt1.ptveskl_activity_date = (
+                                                                     SELECT MAX(ptveskl_activity_date)
+                                                                     FROM ptveskl pt2
+                                                                     WHERE pt1.ptveskl_code = pt2.ptveskl_code AND
+                                                                           pt2.ptveskl_activity_date <= TO_DATE(v_report_date,'yyyymmdd')
+                                                                    ) AND
+                                        og.ftvorgn_eff_date <= TO_DATE(v_report_date,'yyyymmdd') AND
+                                        og.ftvorgn_nchg_date >= TO_DATE(v_report_date,'yyyymmdd') AND
+                                        (eh1.perehis_effective_date = (
+                                                                       SELECT MAX(perehis_effective_date)
+                                                                       FROM payroll.perehis eh2
+                                                                       WHERE eh1.perehis_pidm = eh2.perehis_pidm AND
+                                                                             eh2.perehis_effective_date <= TO_DATE(v_report_date,'yyyymmdd')
+                                                                      ) OR eh1.perehis_effective_date IS NULL) AND
+                                        (og2.ftvorgn_eff_date <= TO_DATE(v_report_date,'yyyymmdd') OR og2.ftvorgn_eff_date IS NULL) AND
+                                        (og2.ftvorgn_nchg_date >= TO_DATE(v_report_date,'yyyymmdd') OR og2.ftvorgn_nchg_date IS NULL) AND
+                                        sp2.spriden_change_ind IS NULL AND
+                                        (
+                                         (jb3.nbrjobs_effective_date = (
+                                                                        SELECT MAX(nbrjobs_effective_date)
+                                                                        FROM posnctl.nbrjobs jb4
+                                                                        WHERE jb3.nbrjobs_pidm = jb4.nbrjobs_pidm AND
+                                                                              jb3.nbrjobs_posn = jb4.nbrjobs_posn AND
+                                                                              jb3.nbrjobs_suff = jb4.nbrjobs_suff AND
+                                                                              jb4.nbrjobs_effective_date <= TO_DATE(v_report_date,'yyyymmdd')
+                                                                       )
+                                         ) OR jb3.nbrjobs_effective_date IS NULL) AND
+                                        tot1.nbrptot_effective_date = (
+                                                                       SELECT MAX(nbrptot_effective_date)
+                                                                       FROM posnctl.nbrptot tot2
+                                                                       WHERE tot1.nbrptot_posn = tot2.nbrptot_posn AND
+                                                                             tot2.nbrptot_effective_date <= TO_DATE(v_report_date,'yyyymmdd')
+                                                                      ) AND
+                                        og3.ftvorgn_eff_date <= TO_DATE(v_report_date,'yyyymmdd') AND
+                                        og3.ftvorgn_nchg_date >= TO_DATE(v_report_date,'yyyymmdd')
+                                  GROUP BY sp.spriden_pidm
+                                          ,sp.spriden_id
+                                          ,sp.spriden_last_name
+                                          ,sp.spriden_first_name
+                                          ,sp.spriden_mi
+                                          ,sb.spbpers_name_prefix
+                                          ,sb.spbpers_name_suffix
+                                          ,jb1.nbrjobs_pidm
+                                          ,jb1.nbrjobs_posn
+                                          ,jb1.nbrjobs_suff
+                                          ,nb.nbrbjob_contract_type
+                                          ,ph1.nbrposh_ecls_code
+                                          ,ec.ptrecls_long_desc
+                                          ,ph1.nbrposh_pcls_code
+                                          ,pc.ntrpcls_desc
+                                          ,ph1.nbrposh_exempt_ind
+                                          ,pc.ntrpcls_eskl_code
+                                          ,pt1.ptveskl_desc
+                                          ,jb1.nbrjobs_status
+                                          ,jb1.nbrjobs_desc
+                                          ,ph1.nbrposh_title
+                                          ,jb1.nbrjobs_ecls_code
+                                          ,ec.ptrecls_long_desc
+                                          ,jb1.nbrjobs_pict_code
+                                          ,jb1.nbrjobs_orgn_code_ts
+                                          ,og.ftvorgn_title
+                                          ,tot1.nbrptot_orgn_code
+                                          ,og3.ftvorgn_title
+                                          ,jb1.nbrjobs_sal_table
+                                          ,jb1.nbrjobs_sal_grade
+                                          ,jb1.nbrjobs_sal_step
+                                          ,jb1.nbrjobs_lgcd_code
+                                          ,nt.ntrsalb_ind
+                                          ,jb1.nbrjobs_appt_pct
+                                          ,jb1.nbrjobs_fte
+                                          ,fte_total.total_fte
+                                          ,jb1.nbrjobs_hrs_day
+                                          ,jb1.nbrjobs_hrs_pay
+                                          ,jb1.nbrjobs_shift
+                                          ,jb1.nbrjobs_reg_rate
+                                          ,jb1.nbrjobs_factor
+                                          ,jb1.nbrjobs_ann_salary
+                                          ,jb1.nbrjobs_per_pay_salary
+                                          ,jb1.nbrjobs_pays
+                                          ,jb1.nbrjobs_pers_chg_date
+                                          ,jb1.nbrjobs_effective_date
+                                          ,jb1.nbrjobs_jcre_code
+                                          ,jc.ptrjcre_desc
+                                          ,jb1.nbrjobs_sgrp_code
+                                          ,jb1.nbrjobs_dfpr_code
+                                          ,jb1.nbrjobs_time_entry_method
+                                          ,jb1.nbrjobs_time_entry_type
+                                          ,jb1.nbrjobs_time_in_out_ind
+                                          ,jb1.nbrjobs_leav_rept_method
+                                          ,jb1.nbrjobs_pict_code_leav_rept
+                                          ,NVL(eh1.perehis_empl_status,pb.pebempl_empl_status)
+                                          ,CASE WHEN eh1.perehis_home_orgn IS NOT NULL THEN eh1.perehis_home_orgn ELSE pb.pebempl_orgn_code_home END
+                                          ,og2.ftvorgn_title
+                                          ,NVL(eh1.perehis_ecls_code, pb.pebempl_ecls_code)
+                                          ,ec.ptrecls_long_desc
+                                          ,NVL(eh1.perehis_dicd_code, pb.pebempl_dicd_code)
+                                          ,div.gtvdicd_desc
+                                          ,NVL(eh1.perehis_lcat_code, pb.pebempl_lcat_code)
+                                          ,NVL(eh1.perehis_bcat_code, pb.pebempl_bcat_code)
+                                          ,NVL(eh1.perehis_first_hire_date, pb.pebempl_first_hire_date)
+                                          ,NVL(eh1.perehis_current_hire_date, pb.pebempl_current_hire_date)
+                                          ,NVL(eh1.perehis_adj_service_date, pb.pebempl_adj_service_date)
+                                          ,NVL(eh1.perehis_seniority_date, pb.pebempl_seniority_date)
+                                          ,NVL(eh1.perehis_lrea_code, pb.pebempl_lrea_code)
+                                          ,NVL(eh1.perehis_loa_beg_date, pb.pebempl_loa_beg_date)
+                                          ,NVL(eh1.perehis_loa_end_date, pb.pebempl_loa_end_date)
+                                          ,NVL(eh1.perehis_trea_code, pb.pebempl_trea_code)
+                                          ,NVL(eh1.perehis_term_date, pb.pebempl_term_date)
+                                          ,NVL(eh1.perehis_internal_ft_pt_ind, pb.pebempl_internal_ft_pt_ind)
+                                          ,CASE WHEN eh1.perehis_jbln_code IS NOT NULL THEN eh1.perehis_jbln_code ELSE pb.pebempl_jbln_code END
+                                          ,lc2.ptrjbln_desc
+                                          ,NVL(eh1.perehis_coll_code, pb.pebempl_coll_code)
+                                          ,NVL(eh1.perehis_camp_code, pb.pebempl_camp_code)
+                                          ,eh1.perehis_coll_code
+                                          ,eh1.perehis_camp_code
+                                          ,nb.nbrbjob_step_incr_day
+                                          ,nb.nbrbjob_step_incr_mon
+                                          ,sb.spbpers_birth_date
+                                          ,((TO_DATE(v_report_date,'yyyymmdd') - sb.spbpers_birth_date)/365.25)
+                                          ,sb.spbpers_sex
+                                          ,sb.spbpers_ethn_code
+                                          ,sv.stvethn_desc
+                                          ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE sp2.spriden_id END
+                                          ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE sup_email.goremal_email_address END
+                                          ,jb1.nbrjobs_supervisor_posn
+                                          ,CASE WHEN jb1.nbrjobs_supervisor_suff IS NOT NULL THEN '="'||jb1.nbrjobs_supervisor_suff||'"' ELSE '' END
+                                          ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE jb3.nbrjobs_desc END
+                                          ,CASE WHEN jb1.nbrjobs_supervisor_pidm IS NULL THEN '' ELSE (sp2.spriden_last_name||', '||sp2.spriden_first_name) END
+                                          ,pb2.pebempl_empl_status
+                                          ,email.goremal_email_address
+                                  ORDER BY sp.spriden_id
+                                          ,jb1.nbrjobs_posn
+                                          ,jb1.nbrjobs_suff
+                                 ),  
+                 instructor AS ( -- finding all people from above query who taught classes at any point  
+                                SELECT sir.sirasgn_term_code 
+                                      ,sir.sirasgn_crn
+                                      ,spr.spriden_id
+                                      ,sir.sirasgn_primary_ind
+                                FROM sirasgn sir JOIN spriden spr ON (sir.sirasgn_pidm = spr.spriden_pidm) 
+                                WHERE spr.spriden_change_ind IS NULL
+                                    AND sirasgn_primary_ind = 'Y'
+                               ),                
+                 course AS ( -- show all courses for all terms
+                             SELECT ssbsect_term_code 
+                                   ,ssbsect_crn 
+                                   ,ssbsect_subj_code 
+                                   ,ssbsect_crse_numb 
+                                   ,ssbsect_seq_numb 
+                                   ,scbcrse_title 
+                                   ,scbcrse_coll_code 
+                                   ,scbcrse_dept_code 
+                                   ,ssbsect_enrl
+                                   ,ssbsect_gradable_ind
+                                   ,scbcrse_credit_hr_low
+                                   ,scbcrse_credit_hr_high
+                                   ,CASE 
+                                        WHEN scbcrse_credit_hr_low = 0 
+                                            AND scbcrse_credit_hr_high IS NULL 
+                                            AND ssbsect_enrl > 0 THEN 'NOT_FOR_CREDIT' 
+                                        ELSE 'FOR_CREDIT' 
+                                    END AS credit_ind
+                             FROM ssbsect ssb JOIN scbcrse scb ON (scb.scbcrse_subj_code = ssb.ssbsect_subj_code AND scb.scbcrse_crse_numb = ssb.ssbsect_crse_numb)
+                             WHERE scb.scbcrse_csta_code = 'A' 
+                                 AND scb.scbcrse_eff_term = (
+                                                             SELECT MAX(scb.scbcrse_eff_term)
+                                                             FROM scbcrse scb
+                                                             WHERE scb.scbcrse_subj_code = ssb.ssbsect_subj_code
+                                                                 AND scb.scbcrse_crse_numb = ssb.ssbsect_crse_numb
+                                                                 AND scb.scbcrse_eff_term <= ssb.ssbsect_term_code
+                                                            )
+                            ),
+                 instructor_course AS ( -- joining the instructor to the course   
+                                       SELECT * 
+                                       FROM instructor b JOIN course c ON (b.sirasgn_crn = c.ssbsect_crn AND b.sirasgn_term_code = c.ssbsect_term_code)
+                                      ),                    
+                 get_data AS ( -- should show 1 record per person, had to put this in another WITH clause becuase of the rank
+                              SELECT a.spriden_pidm 
+                                    ,a.spriden_id
+                                    ,a.spriden_last_name
+                                    ,a.spriden_first_name
+                                    ,b.ssbsect_term_code
+                                    ,a.nbajobs_pay_id
+                                    ,b.ssbsect_enrl
+                                    ,b.ssbsect_gradable_ind
+                                    ,a.eeo_code_desc
+                                    ,b.ssbsect_crn 
+                                    ,b.scbcrse_credit_hr_low
+                                    ,b.scbcrse_credit_hr_high
+                                    ,b.credit_ind
+                                    ,ROW_NUMBER() OVER (PARTITION BY a.spriden_id ORDER BY CASE a.eeo_code_desc WHEN 'Faculty' THEN eeo_code_desc ELSE 'Not Faculty' END, b.credit_ind) rk -- some people have faculty and non-faculty records, the rank should show only the faculty
+                             FROM employee a JOIN instructor_course b ON (a.spriden_id = b.spriden_id)
+                             WHERE b.ssbsect_term_code = p_term
+                            )
+                 SELECT DISTINCT 
+                        spriden_pidm 
+                       ,spriden_id
+                       ,spriden_last_name
+                       ,spriden_first_name
+                       ,ssbsect_term_code
+                       ,nbajobs_pay_id
+                       ,ssbsect_enrl
+                       ,ssbsect_gradable_ind
+                       ,eeo_code_desc
+                       ,ssbsect_crn
+                       ,scbcrse_credit_hr_low
+                       ,scbcrse_credit_hr_high
+                 FROM get_data 
+                 WHERE rk = 1;                    
+
+
+/**********************************************************************/
+/***************              Main Program              ***************/
+/**********************************************************************/
+
+    BEGIN    
+                                     
+        -- populate the table with the needed cohorts
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F1 - Total full-time students', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F2 - Total part-time students', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F3 - Full-time equivalent of part-time students', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F4 - Total full-time equivalent students', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F5 - Number of full-time instructional staff as reported on the HR survey component', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F6 - Of the number of full-time instructional staff reported in Line F5, the number teaching exclusively non-credit courses', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts
+        VALUES ('F7 - Total adjusted full-time instructional staff', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F8 - Number of part-time instructional staff as reported on the HR survey component', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F9 - Of the number of part-time instructional staff reported in Line F8, the number teaching exclusively non-credit courses', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F10 - Number of administrators, or other staff NOT reported to IPEDS as instructors, that are teaching a credit course(s) in the Fall', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F11 - Total adjusted part-time instructional staff', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F12 - Full-time equivalent of adjusted part-time instructional staff', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F13 - Total full-time equivalent instructional staff', 0, p_term, SYSDATE); 
+        
+        INSERT INTO ipeds_spring_stu_fac_counts 
+        VALUES ('F14 - Student-to-faculty ratio', 0, p_term, SYSDATE); 
+        
+        COMMIT;
+        
+        
+        UPDATE ipeds_spring_stu_fac_counts sf2 
+        SET sf2.count_total = (SELECT COUNT(*) FROM ipeds_spring_coll_details sf1 WHERE SUBSTR(sf1.cohort, 1, 4) = 'FULL' AND sf1.reporting_term = p_term)
+        WHERE sf2.stu_fac_group LIKE 'F1 -%' AND sf2.reporting_term = p_term;
+        COMMIT;
+        
+        UPDATE ipeds_spring_stu_fac_counts sf2
+        SET sf2.count_total = (SELECT COUNT(*) FROM ipeds_spring_coll_details sf1 WHERE SUBSTR(sf1.cohort, 1, 4) = 'PART' AND sf1.reporting_term = p_term)
+        WHERE sf2.stu_fac_group LIKE 'F2 -%' AND sf2.reporting_term = p_term;
+        COMMIT;
+        
+        UPDATE ipeds_spring_stu_fac_counts sf2
+        SET sf2.count_total = (SELECT TRUNC(sf1.count_total / 3) FROM ipeds_spring_stu_fac_counts sf1 WHERE sf1.stu_fac_group LIKE 'F2 -%' AND sf1.reporting_term = p_term)
+        WHERE sf2.stu_fac_group LIKE 'F3 -%' AND sf2.reporting_term = p_term;
+        COMMIT;
+        
+        UPDATE ipeds_spring_stu_fac_counts sf3
+        SET sf3.count_total = (
+                            (SELECT sf1.count_total FROM ipeds_spring_stu_fac_counts sf1 WHERE sf1.stu_fac_group LIKE 'F1 -%' AND sf1.reporting_term = p_term) + 
+                            (SELECT sf2.count_total FROM ipeds_spring_stu_fac_counts sf2 WHERE sf2.stu_fac_group LIKE 'F3 -%' AND sf2.reporting_term = p_term)
+                          )
+        WHERE sf3.stu_fac_group LIKE 'F4 -%' AND sf3.reporting_term = p_term;
+        COMMIT;
+        
+                      
+        OPEN cur_stu_to_fac; 
+
+            LOOP 
+               v_spriden_pidm := '';  
+               v_spriden_id := '';  
+               v_spriden_last_name := '';
+               v_spriden_first_name := '';
+               v_nbajobs_pay_id := '';
+               v_eeo_code_desc := '';            
+               v_scbcrse_credit_hr_low := ''; 
+               v_scbcrse_credit_hr_high := ''; 
+               v_ssbsect_crn := '';             
+               v_ssbsect_term_code := '';       
+               v_ssbsect_enrl := '';     
+               v_ssbsect_gradable_ind := '';        
+               v_scbcrse_eff_term := '';  
+               
+                FETCH cur_stu_to_fac
+                   INTO v_spriden_pidm,
+                        v_spriden_id,
+                        v_spriden_last_name,
+                        v_spriden_first_name,
+                        v_ssbsect_term_code,
+                        v_nbajobs_pay_id,
+                        v_ssbsect_enrl,
+                        v_ssbsect_gradable_ind,
+                        v_eeo_code_desc,
+                        v_ssbsect_crn,
+                        v_scbcrse_credit_hr_low,
+                        v_scbcrse_credit_hr_high;
+                EXIT WHEN cur_stu_to_fac%NOTFOUND;               
+                
+            INSERT INTO ipeds_spring_stu_fac_details (spriden_pidm, spriden_id, spriden_last_name, spriden_first_name, ssbsect_term_code, 
+                                                      nbajobs_pay_id, ssbsect_enrl, eeo_code_desc, ssbsect_crn, scbcrse_credit_hr_low, reporting_term, date_added) 
+            VALUES (v_spriden_pidm, v_spriden_id, v_spriden_last_name, v_spriden_first_name, v_ssbsect_term_code, 
+                    v_nbajobs_pay_id, v_ssbsect_enrl, v_eeo_code_desc, v_ssbsect_crn, v_scbcrse_credit_hr_low, p_term, SYSDATE); 
+            COMMIT;
+                          
+                    IF v_eeo_code_desc != 'Faculty' THEN
+                        IF v_ssbsect_gradable_ind = 'Y' THEN 
+                            UPDATE ipeds_spring_stu_fac_counts 
+                            SET count_total = count_total + 1 
+                            WHERE stu_fac_group = ('F10 -%') AND reporting_term = p_term;
+                        END IF;    
+                    ELSIF v_nbajobs_pay_id = 'FT' THEN
+                        IF v_eeo_code_desc = 'Faculty' THEN
+                            UPDATE ipeds_spring_stu_fac_counts 
+                            SET count_total = count_total + 1 
+                            WHERE stu_fac_group LIKE ('F5 -%') AND reporting_term = p_term;
+                        END IF;  
+                    ELSIF v_nbajobs_pay_id = 'PT' THEN
+                        IF v_eeo_code_desc = 'Faculty' THEN
+                            UPDATE ipeds_spring_stu_fac_counts 
+                            SET count_total = count_total + 1 
+                            WHERE stu_fac_group LIKE ('F8 -%') AND reporting_term = p_term;
+                        END IF;
+                    END IF; 
+                    
+                    IF v_eeo_code_desc = 'Faculty' THEN
+                        IF v_scbcrse_credit_hr_low = 0 THEN ------ 
+                            IF v_scbcrse_credit_hr_high IS NULL THEN ------ These three lines are the criteria Sherri said should give us non-credit courses
+                                IF v_ssbsect_enrl > 0 THEN ------
+                                    IF v_nbajobs_pay_id = 'FT' THEN -- full time teaching & only non-credit courses
+                                        UPDATE ipeds_spring_stu_fac_counts 
+                                        SET count_total = count_total + 1 
+                                        WHERE stu_fac_group LIKE ('F6 -%') AND reporting_term = p_term;
+                                    ELSIF v_nbajobs_pay_id = 'PT' THEN -- part time teaching & only non-credit courses
+                                        UPDATE ipeds_spring_stu_fac_counts 
+                                        SET count_total = count_total + 1 
+                                        WHERE stu_fac_group LIKE ('F9 -%') AND reporting_term = p_term;
+                                    END IF;
+                                END IF; 
+                            END IF;
+                        END IF;           
+                    END IF;  
+                                  
+                    COMMIT;            
+         
+            END LOOP;
+            
+        UPDATE ipeds_spring_stu_fac_counts sf3 
+        SET sf3.count_total = (
+                                (SELECT sf1.count_total FROM ipeds_spring_stu_fac_counts sf1 WHERE sf1.stu_fac_group LIKE 'F5 -%' AND sf1.reporting_term = p_term) - 
+                                (SELECT sf2.count_total FROM ipeds_spring_stu_fac_counts sf2 WHERE sf2.stu_fac_group LIKE 'F6 -%' AND sf2.reporting_term = p_term)  
+                              )
+        WHERE sf3.stu_fac_group LIKE 'F7 -%' AND sf3.reporting_term = p_term;
+        COMMIT;
+        
+        UPDATE ipeds_spring_stu_fac_counts sf4
+        SET sf4.count_total = (
+                                (SELECT sf1.count_total FROM ipeds_spring_stu_fac_counts sf1 WHERE sf1.stu_fac_group LIKE 'F8 -%' AND sf1.reporting_term = p_term) - 
+                                (SELECT sf2.count_total FROM ipeds_spring_stu_fac_counts sf2 WHERE sf2.stu_fac_group LIKE 'F9 -%' AND sf2.reporting_term = p_term) + 
+                                (SELECT sf3.count_total FROM ipeds_spring_stu_fac_counts sf3 WHERE sf3.stu_fac_group LIKE 'F10 -%' AND sf3.reporting_term = p_term)
+                              )
+        WHERE sf4.stu_fac_group LIKE 'F11 -%' AND sf4.reporting_term = p_term;
+        COMMIT;
+        
+        UPDATE ipeds_spring_stu_fac_counts sf2 
+        SET sf2.count_total = (SELECT TRUNC(sf1.count_total / 3) FROM ipeds_spring_stu_fac_counts sf1 WHERE sf1.stu_fac_group LIKE 'F11 -%' AND sf1.reporting_term = p_term)
+        WHERE sf2.stu_fac_group LIKE 'F12 -%' AND sf2.reporting_term = p_term;
+        COMMIT;
+
+        UPDATE ipeds_spring_stu_fac_counts sf3
+        SET sf3.count_total = (
+                                (SELECT sf1.count_total FROM ipeds_spring_stu_fac_counts sf1 WHERE sf1.stu_fac_group LIKE 'F7 -%' AND sf1.reporting_term = p_term) + 
+                                (SELECT sf2.count_total FROM ipeds_spring_stu_fac_counts sf2 WHERE sf2.stu_fac_group LIKE 'F12 -%' AND sf2.reporting_term = p_term)
+                              )
+        WHERE sf3.stu_fac_group LIKE 'F13 -%' AND sf3.reporting_term = p_term;
+        COMMIT;
+         
+        UPDATE ipeds_spring_stu_fac_counts sf3
+        SET sf3.count_total = TRUNC(
+                                      (SELECT sf1.count_total FROM ipeds_spring_stu_fac_counts sf1 WHERE sf1.stu_fac_group LIKE 'F4 -%' AND sf1.reporting_term = p_term) / 
+                                      (SELECT sf2.count_total FROM ipeds_spring_stu_fac_counts sf2 WHERE sf2.stu_fac_group LIKE 'F13 -%' AND sf2.reporting_term = p_term)
+                                   )
+        WHERE sf3.stu_fac_group LIKE 'F14 -%' AND sf3.reporting_term = p_term;
+        COMMIT;
+        
+                             
+        CLOSE cur_stu_to_fac;     
+                
+
+    EXCEPTION
+        WHEN OTHERS
+        THEN NULL;
+     
+    END StudentToFaculty;    
+
+
+    PROCEDURE PartA (p_term IN VARCHAR2) 
+    IS
+    
+    BEGIN
+    
+         GetDataSet (p_term);
+         COMMIT;
+         
+    END PartA;
+    
+    PROCEDURE PartA_DL (p_term IN VARCHAR2)  
+    IS
+    
+    BEGIN
+    
+         GetDataSet_DL (p_term);
+         COMMIT;
+         
+    END PartA_DL;
+    
+    PROCEDURE PartB (p_term IN VARCHAR2) 
+    IS
+    
+    BEGIN
+    
+         AggregateAge (p_term);
+         COMMIT;
+         
+    END PartB;
+    
+    PROCEDURE PartC (p_term IN VARCHAR2) 
+    IS
+    
+    BEGIN
+    
+         Residency (p_term);
+         COMMIT;
+         
+    END PartC;
+    
+    PROCEDURE PartD (p_term IN varchar2) 
+    IS
+    
+    BEGIN
+    
+         TotalUndergraduateEnteringClass (p_term);
+         COMMIT;
+         
+    END PartD;
+    
+    PROCEDURE PartE (p_year IN NUMBER)  
+    IS
+    
+    BEGIN
+    
+         RetentionRates (p_year);
+         COMMIT;
+         
+    END PartE;
+        
+    PROCEDURE PartF (p_term IN VARCHAR2) 
+    IS
+    
+    BEGIN
+    
+         StudentToFaculty (p_term);
+         COMMIT;
+         
+    END PartF;
+   
+END ETL_IPEDS_SPRING_COLLECTION;
